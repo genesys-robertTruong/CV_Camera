@@ -1,0 +1,20 @@
+# Secrets -- never commit
+password.txt
+id_ed25519_cv_camera
+id_ed25519_cv_camera.pub
+*.pem
+New Text Document.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime artifacts pulled from the Pi
+*.log
+*.jpg
+*.jpeg
+*.png
+*.deb
+captures/

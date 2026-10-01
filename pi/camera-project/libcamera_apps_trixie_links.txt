@@ -1,0 +1,31 @@
+declare -A package_names
+declare -A package_download_links 
+
+package_names["trixie"]="rpicam-apps_1.9.1-2_armhf_trixie.zip"
+package_download_links["trixie"]="https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.9.1-2_armhf_trixie.zip"
+
+package_names["trixie-arm64"]="rpicam-apps_1.9.1-2_arm64_trixie.zip"
+package_download_links["trixie-arm64"]="https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.9.1-2_arm64_trixie.zip"
+
+package_names["trixie"]="rpicam-apps_1.10.1-2_armhf_trixie.zip"
+package_download_links["trixie"]="https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.10.1-2_armhf_trixie.zip"
+
+package_names["trixie-arm64"]="rpicam-apps_1.10.1-2_arm64_trixie.zip"
+package_download_links["trixie-arm64"]="https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.10.1-2_arm64_trixie.zip"
+
+package_names[trixie]=rpicam-apps_1.11.1-2_armhf_trixie.zip
+package_download_links[trixie]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.11.1-2_armhf_trixie.zip
+
+package_names[trixie-arm64]=rpicam-apps_1.11.1-2_arm64_trixie.zip
+package_download_links[trixie-arm64]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.11.1-2_arm64_trixie.zip
+
+package_names[trixie]=rpicam-apps_1.12.0-2_armhf_trixie.zip
+package_download_links[trixie]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.12.0-2_armhf_trixie.zip
+
+package_names[trixie-arm64]=rpicam-apps_1.12.0-2_arm64_trixie.zip
+package_download_links[trixie-arm64]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.12.0-2_arm64_trixie.zip
+package_names[trixie]=rpicam-apps_1.13.0-2_armhf_trixie.zip
+package_download_links[trixie]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.13.0-2_armhf_trixie.zip
+
+package_names[trixie-arm64]=rpicam-apps_1.13.0-2_arm64_trixie.zip
+package_download_links[trixie-arm64]=https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/libcamera-apps-v0.0.5/rpicam-apps_1.13.0-2_arm64_trixie.zip
