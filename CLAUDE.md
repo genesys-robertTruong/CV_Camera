@@ -54,6 +54,26 @@ encoder pool, plus a decoupled stabilization worker.
 
 Images, logs, `.deb` files and `captures/` are not tracked.
 
+## Custom crop modes are NOT true 1:1
+
+The custom `arducam_64mp.ko` (built 2026-09-25, stock kept as
+`arducam_64mp.ko.xz.stock-backup`; source not on the Pi) adds 1968x1476..3200x2400
+"1:1 crop" modes. Raw-level tests show they are effectively 2x2-binned and
+re-expanded inside the sensor (half the real detail, blocky edges) -- see
+`work/bin_test.py`. They also have a fixed 44802-px HBLANK (52 us/line), which
+is why they cap at ~10fps. Only the stock full 9248x6944 mode gives true 1:1
+detail (~2.7fps sensor max; raw is 9152 wide after the ISP's width limit).
+`mjpeg_crop720.py` uses the full mode by default (`--custom` for the old one).
+
+## Focusing the 64MP
+
+Autofocus (even with `--autofocus-window`) can land slightly off -- the depth
+of field at full res is very shallow (sharpness peak only ~0.2 dioptre wide).
+For a critical subject, sweep `--autofocus-mode manual --lens-position <d>` in
+0.1 steps at 4624x3472, score the subject ROI with Laplacian variance, then
+shoot 9248x6944 at the best position. Objects ~on the bench behind the box
+were sharpest at ~6.65.
+
 ## Conventions
 
 - Comments explain *why*, including hardware facts found by testing (mode lists,
