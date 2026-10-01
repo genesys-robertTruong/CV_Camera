@@ -17,6 +17,7 @@ Single process, one Picamera2 for its whole lifetime -- no mode switching, so
 the reconfigure timeouts that forced mjpeg_server.py's subprocess-per-mode
 design don't apply here.
 """
+import json
 import logging
 import os
 import socketserver
@@ -75,7 +76,7 @@ else:
 ENCODER_THREADS = 4 if MODE in ("3k", "4k") else 3
 JPEG_QUALITY = 85
 PORT = 8080
-START_LENS = 6.65  # dioptres; best focus for the bench scene (see CLAUDE.md)
+START_LENS = 6.65  # dioptres; starting point before the startup centre focus
 
 PAGE = """\
 <html>
@@ -86,7 +87,17 @@ PAGE = """\
   :root { color-scheme: dark; }
   body { margin: 0; background: #000; color: #ddd;
          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  #video { display: block; max-width: 100%; margin: 0 auto; }
+  #wrap { position: relative; width: fit-content; max-width: 100%; margin: 0 auto; }
+  #video { display: block; max-width: 100%; cursor: crosshair; touch-action: manipulation;
+           -webkit-user-drag: none; user-select: none; }
+  #marker { position: absolute; display: none; box-sizing: border-box; pointer-events: none;
+            border: 2px solid #ffd54a; border-radius: 4px; transition: border-color 0.2s; }
+  #marker.done { border-color: #5fd36b; } #marker.failed { border-color: #ff5a5a; }
+  .seg { display: inline-flex; margin-left: 0.8em; border: 1px solid #444; border-radius: 4px; overflow: hidden; vertical-align: middle; }
+  .seg input { display: none; }
+  .seg label { padding: 0.35em 0.7em; cursor: pointer; background: #222; color: #aaa; }
+  .seg input:checked + label { background: #2f5d8f; color: #fff; }
+  #fstatus { font-family: ui-monospace, monospace; font-size: 0.85em; color: #ffd54a; margin-top: 0.4em; min-height: 1.2em; }
   #controls { max-width: 1280px; margin: 0 auto; padding: 0.8em 1em; }
   input[type=range] { width: 100%; accent-color: #4a9eff; }
   button { background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 0.35em 0.7em; }
@@ -95,12 +106,17 @@ PAGE = """\
 </style>
 </head>
 <body>
-<img id="video" src="stream.mjpg" />
+<div id="wrap"><img id="video" src="stream.mjpg" draggable="false" /><div id="marker"></div></div>
 <div id="controls">
   <div>
+    <button id="refocus">Focus centre</button>
     <button id="cont">Continuous AF</button>
-    <button id="refocus">Refocus once</button>
+    <span class="seg" title="Fast: phase-detect AF only. ~1s in 3k/4k; 720p/1080p have too little phase confidence when badly defocused and add a contrast scan (~2.5s). Lands within ~0.1-0.2 dioptre of best focus. Precise: then a contrast sweep on the tapped spot (~1-2s more) that lands on the true sharpness peak.">
+      <input type="radio" name="afq" id="afFast" value="0"><label for="afFast">Fast (phase AF)</label>
+      <input type="radio" name="afq" id="afPrecise" value="1"><label for="afPrecise">Precise (phase + contrast)</label>
+    </span>
   </div>
+  <div id="fstatus">Tap the video to focus there.</div>
   <div style="margin-top: 0.6em;">
     <label>Manual focus (dioptres): <span id="fv"></span>
       <input type="range" id="focus" min="LENS_MIN" max="LENS_MAX" step="0.01" value="6.65">
@@ -121,9 +137,49 @@ function send(pos) {
     if (queued !== null) { const q = queued; queued = null; send(q); }
   });
 }
-f.addEventListener('input', () => { fv.textContent = f.value; send(f.value); });
-document.getElementById('cont').onclick = () => fetch('/afmode?mode=continuous');
-document.getElementById('refocus').onclick = () => fetch('/refocus');
+f.addEventListener('input', () => { fv.textContent = f.value; marker.style.display = 'none'; send(f.value); });
+document.getElementById('cont').onclick = () => { marker.style.display = 'none'; fetch('/afmode?mode=continuous'); };
+
+// Tap-to-focus: the AF window is WIN_FRAC of the frame in each dimension,
+// centred on the tap (clamped inside the frame), same as the server uses.
+const WIN = WIN_FRAC, video = document.getElementById('video'), marker = document.getElementById('marker');
+const fstatus = document.getElementById('fstatus');
+let polling = null;
+function tapFocus(fx, fy) {
+  const cx = Math.min(Math.max(fx, WIN / 2), 1 - WIN / 2), cy = Math.min(Math.max(fy, WIN / 2), 1 - WIN / 2);
+  Object.assign(marker.style, { display: 'block', left: (cx - WIN / 2) * 100 + '%', top: (cy - WIN / 2) * 100 + '%',
+                                width: WIN * 100 + '%', height: WIN * 100 + '%' });
+  marker.className = '';
+  fstatus.textContent = 'Focusing...';
+  const precise = document.getElementById('afPrecise').checked ? 1 : 0;
+  fetch('/tapfocus?x=' + fx.toFixed(4) + '&y=' + fy.toFixed(4) + '&refine=' + precise);
+  if (!polling) polling = setInterval(pollFocus, 250);
+}
+function pollFocus() {
+  fetch('/focusstatus').then(r => r.json()).then(st => {
+    fstatus.textContent = st.text;
+    if (st.state === 'done' || st.state === 'failed' || st.state === 'idle') {
+      marker.className = st.state === 'failed' ? 'failed' : 'done';
+      clearInterval(polling); polling = null;
+      if (st.lens !== null) { f.value = st.lens; fv.textContent = st.lens.toFixed(2); }
+    }
+  }).catch(() => {});
+}
+video.addEventListener('click', (e) => {
+  const r = video.getBoundingClientRect();
+  tapFocus((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+});
+document.getElementById('refocus').onclick = () => tapFocus(0.5, 0.5);
+// Fast/Precise choice: remembered per browser (default DEFAULT_AFQ).
+let afq = 'DEFAULT_AFQ';
+try { afq = localStorage.getItem('afq') || afq; } catch (e) {}
+document.getElementById(afq === 'fast' ? 'afFast' : 'afPrecise').checked = true;
+for (const id of ['afFast', 'afPrecise'])
+  document.getElementById(id).addEventListener('change', () => {
+    try { localStorage.setItem('afq', id === 'afFast' ? 'fast' : 'precise'); } catch (e) {}
+  });
+// Show the startup centre focus as it happens.
+marker.style.display = 'none'; polling = setInterval(pollFocus, 250);
 setInterval(() => fetch('/afinfo').then(r => r.text())
   .then(t => document.getElementById('info').textContent = t).catch(() => {}), 1000);
 </script>
@@ -161,13 +217,218 @@ def af_info_text():
             f"exp {md.get('ExposureTime')}us gain {md.get('AnalogueGain', 0):.1f}")
 
 
-def refocus():
-    # Blocks up to ~4s; called on its own thread so the stream keeps running.
-    picam2.set_controls({"AfMode": 1, "AfTrigger": 0})
-    for _ in range(40):
-        time.sleep(0.1)
-        if picam2.capture_metadata().get("AfState") in (2, 3):
+# Latest captured frame + its metadata, published by capture_loop so the
+# focus code can wait for frames taken *after* a lens move.
+latest = {"seq": 0, "frame": None, "lens": None, "af_state": None}
+latest_cv = Condition()
+
+# Tap-to-focus. Measured on this lens (tools/af_accuracy.py): libcamera's AF
+# gets close fast -- PDAF in the 3k/4k crops, a contrast scan then PDAF in
+# 720p/1080p -- but lands up to ~0.1-0.3 dioptre off the true peak, and the
+# sharp zone is only ~0.3 dioptre wide. So a tap runs a fast phase stage with
+# the AF window on the tapped spot, then (if `refine`, "Precise") a short
+# contrast sweep around that result, scored on the same spot.
+#
+# The fast stage drives libcamera's *continuous* AF and stops it once it has
+# converged, rather than using its one-shot (AfMode Auto) cycle: from far out
+# of focus, one-shot took 1.5-1.9s and still landed ~0.2 off (and reported
+# Failed in 3k), while continuous slews straight there on phase (~0.7s 1.0 ->
+# 6.6 in 4k). In 720p/1080p, where phase confidence is ~0 when badly
+# defocused, continuous AF itself falls back to a contrast scan first.
+CONVERGED_FRAMES = 4       # lens still (and AfState Focused) this many frames = done
+PHASE_TIMEOUT = 4.0
+#
+# The sweep commands a new lens position every frame without waiting for it
+# to land: a LensPosition change takes ~6-9 frames to reach the image (requests
+# are queued ahead), and frame metadata's LensPosition follows the image to
+# within ~1 frame (tools/lens_latency.py) -- so each frame is scored against
+# the position *it* reports. Waiting per step instead cost ~0.4s/step. One
+# up and one down pass are averaged to cancel that residual ~1-frame skew.
+WIN_FRAC = 0.2             # scoring ROI (and page marker) size, fraction of the frame
+AF_WIN_FRAC = 0.4          # libcamera AF window size: phase needs more PDAF cells than the ROI
+REFINE_HALF_RANGE = 0.30   # dioptres either side of the AF result. Phase AF was measured
+                           # landing 0.1-0.2 short; at 0.21 that hit the sweep edge and cost
+                           # a second pair of passes (4 short passes ~96 frames vs 2 wide ~60)
+REFINE_STEP = 0.03
+CROP = None                # ScalerCrop in use (absolute sensor coords), set at startup
+focus = {"gen": 0, "state": "idle", "text": "", "lens": None}
+focus_lock = threading.Lock()
+
+
+def _wait_frame(after_seq, lens=None, timeout=3.0):
+    """Next frame newer than after_seq (and, if given, reporting that lens
+    position), as (seq, frame, snapshot of `latest`); None on timeout."""
+    deadline = time.time() + timeout
+    with latest_cv:
+        while True:
+            ok = latest["seq"] > after_seq and (
+                lens is None or (latest["lens"] is not None and abs(latest["lens"] - lens) < 0.011))
+            if ok:
+                return latest["seq"], latest["frame"], dict(latest)
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            latest_cv.wait(left)
+
+
+def _set_focus(gen, state, text, lens=None):
+    with focus_lock:
+        if gen != focus["gen"]:
+            return False  # superseded by a newer tap / manual move
+        focus.update(state=state, text=text, lens=lens)
+        return True
+
+
+def _sharpness(frame, roi):
+    x, y, w, h = roi
+    g = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def tap_focus(fx, fy, refine, gen):
+    from libcamera import controls
+    cx0, cy0, cw, ch = CROP
+
+    def window(frac):
+        """Rect of `frac` of the crop centred on the tap, clamped inside it,
+        relative to the crop's top-left."""
+        ww, wh = int(cw * frac), int(ch * frac)
+        return (min(max(int(fx * cw) - ww // 2, 0), cw - ww),
+                min(max(int(fy * ch) - wh // 2, 0), ch - wh), ww, wh)
+
+    rx, ry, ww, wh = window(WIN_FRAC)
+    roi = (rx * OUT_SIZE[0] // cw, ry * OUT_SIZE[1] // ch, ww * OUT_SIZE[0] // cw, wh * OUT_SIZE[1] // ch)
+    ax, ay, aw, ah = window(AF_WIN_FRAC)
+    # libcamera's AF windows are in absolute sensor coordinates (same space
+    # as ScalerCrop).
+    picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Windows,
+                         "AfWindows": [(cx0 + ax, cy0 + ay, aw, ah)]})
+    if not _set_focus(gen, "focusing", "Focusing (libcamera AF)..."):
+        return
+    t0 = time.time()
+    picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+    seq, frames, still, scanned = latest["seq"], 0, 0, 0
+    af_lens, af_state, prev = None, None, None
+    converged = False
+    while time.time() - t0 < PHASE_TIMEOUT:
+        got = _wait_frame(seq)
+        if got is None:
             break
+        seq, _, md = got
+        frames += 1
+        af_lens, af_state = md["lens"], md["af_state"]
+        if frames > 10 and af_state == 1:
+            scanned += 1  # libcamera fell back to a contrast scan (low phase confidence)
+        # Ignore the first ~10 frames: the mode/window change is still in
+        # the request pipeline (same ~6-9 frame lag as lens moves).
+        if frames > 10 and af_lens is not None and prev is not None and abs(af_lens - prev) < 0.015 \
+                and af_state == 2:
+            still += 1
+        else:
+            still = 0
+        prev = af_lens
+        if still >= CONVERGED_FRAMES:
+            converged = True
+            break
+        if gen != focus["gen"]:
+            return
+    if not converged:
+        af_state = 3
+    if af_lens is None:
+        _set_focus(gen, "failed", "AF got no frames")
+        return
+    picam2.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": af_lens})
+    t_af = time.time() - t0
+    how = "Phase AF" if not scanned else "Phase+scan AF"
+    if not refine:
+        state = "failed" if af_state == 3 else "done"
+        _set_focus(gen, state, f"{how} {'did not converge' if af_state == 3 else 'focused'} at "
+                               f"{af_lens:.2f} in {t_af:.1f}s", af_lens)
+        return
+    if not _set_focus(gen, "refining", f"{how} at {af_lens:.2f} in {t_af:.1f}s, refining...", af_lens):
+        return
+
+    def sweep(positions):
+        """Step the lens through `positions`, one per frame, then keep reading
+        until frames report the last one. Returns {reported lens: mean score}."""
+        scores = {}
+        seq = latest["seq"]
+
+        def take(seq):
+            got = _wait_frame(seq)
+            if got is None:
+                return None
+            seq, frame, md = got
+            if md["lens"] is not None:
+                scores.setdefault(round(md["lens"], 3), []).append(_sharpness(frame, roi))
+            return seq
+
+        for lp in positions:
+            if gen != focus["gen"]:
+                return None
+            picam2.set_controls({"LensPosition": float(lp)})
+            seq = take(seq)
+            if seq is None:
+                return None
+        for _ in range(15):  # drain the ~6-9 frame lens pipeline
+            seq = take(seq)
+            if seq is None or round(latest["lens"] or -1, 3) == round(positions[-1], 3):
+                break
+        take(seq)
+        return {lp: sum(v) / len(v) for lp, v in scores.items()}
+
+    def peak(scores, lo, hi):
+        """Parabolic-fit peak of the scores reported within [lo, hi], and
+        whether it sits at the range edge (i.e. the true peak may be outside)."""
+        pts = sorted((lp, sc) for lp, sc in scores.items() if lo - 1e-6 <= lp <= hi + 1e-6)
+        if len(pts) < 3:
+            return None, False
+        i = max(range(len(pts)), key=lambda k: pts[k][1])
+        if i in (0, len(pts) - 1):
+            return pts[i][0], True
+        (l0, s0), (l1, s1), (l2, s2) = pts[i - 1], pts[i], pts[i + 1]
+        den = s0 - 2 * s1 + s2
+        best = l1 + 0.5 * (s0 - s2) / den * (l2 - l1) if den < 0 else l1
+        return best, False
+
+    n = int(round(REFINE_HALF_RANGE / REFINE_STEP))
+    centre, best, passes = af_lens, None, 0
+    for _ in range(2):  # one re-centre allowed if the peak is at the edge
+        grid = [round(min(max(centre + i * REFINE_STEP, lens_min), lens_max), 3) for i in range(-n, n + 1)]
+        up = sweep(grid)
+        down = sweep(grid[::-1]) if up is not None else None
+        if up is None or down is None:
+            return  # superseded, or frames stopped
+        passes += 2
+        pu, edge_u = peak(up, grid[0], grid[-1])
+        pd, edge_d = peak(down, grid[0], grid[-1])
+        if pu is None or pd is None:
+            break
+        best = (pu + pd) / 2
+        if not (edge_u or edge_d) or grid[0] in (lens_min,) or grid[-1] in (lens_max,):
+            break
+        centre = best
+    if best is None:
+        _set_focus(gen, "failed", f"AF at {af_lens:.2f}; refine got no usable frames", af_lens)
+        return
+    best = round(best, 3)
+    picam2.set_controls({"LensPosition": best})
+    _set_focus(gen, "done", f"{how} {af_lens:.2f} ({t_af:.1f}s) -> refined {best:.2f} ({best - af_lens:+.2f}, "
+                            f"{passes} passes, {time.time() - t0 - t_af:.1f}s)", best)
+
+
+def start_tap_focus(fx, fy, refine):
+    with focus_lock:
+        focus["gen"] += 1
+        gen = focus["gen"]
+        focus.update(state="focusing", text="Focusing...", lens=None)
+    threading.Thread(target=tap_focus, args=(fx, fy, refine, gen), daemon=True).start()
+
+
+def cancel_focus_job():
+    with focus_lock:
+        focus["gen"] += 1
+        focus.update(state="idle", text="", lens=None)
 
 
 encoded = {"seq": -1, "count": 0}
@@ -199,8 +460,16 @@ def capture_loop():
     pool = ThreadPoolExecutor(max_workers=ENCODER_THREADS)
     seq = 0
     while True:
-        frame = picam2.capture_array("main")
+        req = picam2.capture_request()
+        try:
+            frame = req.make_array("main")
+            md = req.get_metadata()
+        finally:
+            req.release()
         seq += 1
+        with latest_cv:
+            latest.update(seq=seq, frame=frame, lens=md.get("LensPosition"), af_state=md.get("AfState"))
+            latest_cv.notify_all()
         if slots.acquire(blocking=False):
             pool.submit(_encode_and_publish, seq, frame, slots)
 
@@ -227,7 +496,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     f"max {1e6 / FRAME_LIMITS[1]:.0f} fps" if LLP_PARAM else
                     "Centre 1280x720 of the sensor from the full-res mode, ~2-3 fps")
             body = (PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max))
-                    .replace("MODE_HINT", hint).encode())
+                    .replace("MODE_HINT", hint).replace("WIN_FRAC", str(WIN_FRAC))
+                    .replace("DEFAULT_AFQ", "fast" if MODE == "full" else "precise").encode())
             self._send(body, "text/html")
         elif url.path == "/focus":
             try:
@@ -235,14 +505,28 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             except ValueError:
                 pos = 0.0
             pos = max(lens_min, min(pos, lens_max))
+            cancel_focus_job()
             picam2.set_controls({"AfMode": 0, "LensPosition": pos})
             self._send(f"ok {pos:.2f}".encode())
         elif url.path == "/afmode":
-            picam2.set_controls({"AfMode": 0 if qs.get("mode", [""])[0] == "manual" else 2})
+            # Continuous AF uses the default (centre-weighted) metering again.
+            from libcamera import controls
+            cancel_focus_job()
+            picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Auto,
+                                 "AfMode": 0 if qs.get("mode", [""])[0] == "manual" else 2})
             self._send(b"ok")
-        elif url.path == "/refocus":
-            threading.Thread(target=refocus, daemon=True).start()
-            self._send(b"refocusing")
+        elif url.path == "/tapfocus":
+            try:
+                fx = min(max(float(qs.get("x", ["0.5"])[0]), 0.0), 1.0)
+                fy = min(max(float(qs.get("y", ["0.5"])[0]), 0.0), 1.0)
+            except ValueError:
+                fx = fy = 0.5
+            start_tap_focus(fx, fy, qs.get("refine", ["1"])[0] == "1")
+            self._send(b"focusing")
+        elif url.path == "/focusstatus":
+            with focus_lock:
+                body = json.dumps({k: focus[k] for k in ("state", "text", "lens")}).encode()
+            self._send(body, "application/json")
         elif url.path == "/afinfo":
             self._send(af_info_text().encode())
         elif url.path == "/stream.mjpg":
@@ -296,12 +580,14 @@ if __name__ == "__main__":
     # raw mode's whole window in full-sensor coordinates.
     x, y, w, h = picam2.camera_controls["ScalerCrop"][1]
     crop = (x + (w - OUT_SIZE[0]) // 2, y + (h - OUT_SIZE[1]) // 2, OUT_SIZE[0], OUT_SIZE[1])
-    # Start in manual focus: continuous AF on this narrow crop was seen
-    # settling well off (8.8 vs a measured best of 6.65 for the bench scene).
+    CROP = crop
     picam2.set_controls({"ScalerCrop": crop, "AfMode": 0, "LensPosition": START_LENS})
     lens_min, lens_max, _ = picam2.camera_controls.get("LensPosition", (0.0, 15.0, 0.0))
 
     threading.Thread(target=capture_loop, daemon=True).start()
+    # Focus the centre once at startup (tap-to-focus path, refined), rather
+    # than trusting the fixed START_LENS for whatever scene is in front.
+    start_tap_focus(0.5, 0.5, refine=MODE != "full")
     threading.Thread(target=stream_fps_loop, daemon=True).start()
     try:
         http_server = StreamingServer(("0.0.0.0", PORT), StreamingHandler)

@@ -38,7 +38,7 @@ scp -i id_ed25519_cv_camera -o BatchMode=yes -o IdentitiesOnly=yes <src> william
 |---|---|
 | `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps |
 | `mjpeg_server.py` | Older 64MP server: zoom slider over the *old* custom driver's crop modes (1968x1476..3200x2400) -- those modes no longer exist with our driver, and weren't really 1:1 anyway (see below) |
-| `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity) |
+| `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity), `af_trace.py` / `af_accuracy.py` / `lens_latency.py` (AF behaviour) |
 | `mjpeg_server_csi64mp_backup.py` | Older 64MP server: single mode + ScalerCrop/software zoom + stabilization |
 | `mjpeg_server_imx477.py` | IMX477 HQ camera server (manual lens, no AF) |
 | `arducam_server.py` | USB 48MP webcam via OpenCV/V4L2, software zoom/AF sweep |
@@ -107,14 +107,35 @@ with 2x2-binned full-res vs 0.923 with true full-res; blocky edges), and they
 kept the full mode's 46770-px line length, capping them at ~10fps. That line
 length is what a 9152-px row needs over the 2-lane link; a 1280-px row doesn't.
 
-## Focusing the 64MP
+## Autofocus
 
-Autofocus (even with `--autofocus-window`) can land slightly off -- the depth
-of field at full res is very shallow (sharpness peak only ~0.2 dioptre wide).
-For a critical subject, sweep `--autofocus-mode manual --lens-position <d>` in
-0.1 steps at 4624x3472, score the subject ROI with Laplacian variance, then
-shoot 9248x6944 at the best position. Objects ~on the bench behind the box
-were sharpest at ~6.65.
+The sensor (IMX682) does **PDAF on-chip**: each frame's embedded data carries a
+16x12 phase/confidence grid (3rd embedded line), parsed by Arducam's libcamera
+fork (`CamHelperArducam64MP::parsePdafData`) and used by `rpi.af` -- no driver
+change was needed. The lens is a separate VCM (`dw9807_vcm`); LensPosition is
+dioptres, 0-15 -> VCM 0-1023 (`rpi.af` "map" in the tuning file).
+
+Measured (tools/af_trace.py, tools/af_accuracy.py, tools/lens_latency.py):
+- Phase confidence scales with the crop: the PDAF grid covers the readout
+  window, so 3k/4k cells hold plenty of PD pixels (pure phase), 720p/1080p
+  have ~0 confidence when badly defocused and libcamera falls back to a
+  contrast scan first.
+- Phase AF lands 0.1-0.2 dioptre short of the true sharpness peak; the sharp
+  zone is only ~0.3 dioptre wide. libcamera's one-shot (AfMode Auto) cycle is
+  worse: slower from far defocus and 0.2-0.3 off. Its continuous mode, stopped
+  once converged, is the fast path.
+- A LensPosition change reaches the image ~6-9 frames later (queued
+  requests); frame metadata's LensPosition tracks the image within ~1 frame.
+
+`mjpeg_crop.py` tap-to-focus: tap/click the video (or "Focus centre", which
+also runs at startup). Phase stage = continuous AF with a 40%-of-frame AF
+window on the tap (20% was too few PDAF cells -> fell back to scanning), stopped
+when AfState=Focused and the lens is still for 4 frames, then held. Page
+switch: **Fast** = phase stage only (3k 0.9s, 4k 1.4s from far defocus;
+720p/1080p ~2.5s with the scan); **Precise** = then a contrast sweep of the
+20% tapped ROI, lens stepped every frame (+-0.30 dioptre, 0.03 steps), up and
+down passes averaged, parabolic fit (adds ~1.5-2.5s; all modes land on the
+same peak). "Continuous AF" button = plain libcamera continuous, centre-weighted.
 
 ## Conventions
 
