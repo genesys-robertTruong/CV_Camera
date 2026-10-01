@@ -19,6 +19,7 @@ design don't apply here.
 """
 import json
 import logging
+import math
 import os
 import socketserver
 import sys
@@ -132,9 +133,12 @@ PAGE = """\
       <input type="range" id="focus" min="LENS_MIN" max="LENS_MAX" step="0.01" value="6.65">
     </label>
     <label>Digital zoom (ISP crop): <span id="zv"></span>
-      <input type="range" id="zoom" min="1" max="ZOOM_MAX" step="0.05" value="ZOOM_NOW">
+      <input type="range" id="zoom" min="0" max="1000" step="1" value="0">
     </label>
     <button id="zoom1">1x</button>
+    <label style="flex-basis: 180px;">Zoom sharpening (ISP): <span id="sv"></span>
+      <input type="range" id="sharpen" min="0" max="SHARPEN_MAX" step="0.1" value="SHARPEN_NOW">
+    </label>
   </div>
   <div id="info">loading...</div>
   <p class="hint">MODE_HINT. 1.0x = 1:1 sensor pixels; above that the ISP crops the
@@ -169,16 +173,29 @@ const f = document.getElementById('focus'), fv = document.getElementById('fv');
 const sendFocus = throttled('/focus?position=');
 f.addEventListener('input', () => { fv.textContent = f.value; marker.style.display = 'none'; sendFocus(f.value); });
 
-const z = document.getElementById('zoom'), zv = document.getElementById('zv');
+// Zoom slider is logarithmic (0..1000 -> 1x..ZOOM_LIMIT) so the low end
+// stays usable across a 1-16x range.
+const ZLIM = ZOOM_LIMIT, z = document.getElementById('zoom'), zv = document.getElementById('zv');
 const sendZoom = throttled('/zoom?level=');
+const zoomOf = (t) => Math.pow(ZLIM, t / 1000);
+const posOf = (zoom) => Math.round(1000 * Math.log(zoom) / Math.log(ZLIM));
 function zoomLabel() {
-  const v = parseFloat(z.value);
+  const v = zoomOf(z.value);
   zv.textContent = v.toFixed(2) + 'x' + (v <= 1.0001 ? ' (1:1 sensor pixels)' : ' (ISP upscaled)');
 }
-function setZoom(v) { z.value = v; zoomLabel(); marker.style.display = 'none'; sendZoom(z.value); }
-z.addEventListener('input', () => setZoom(z.value));
-document.getElementById('zoom1').onclick = () => setZoom(1);
+function setZoomPos(t) {
+  z.value = t; zoomLabel(); marker.style.display = 'none'; sendZoom(zoomOf(z.value).toFixed(3));
+}
+z.addEventListener('input', () => setZoomPos(z.value));
+document.getElementById('zoom1').onclick = () => setZoomPos(0);
+z.value = posOf(ZOOM_NOW);
 zoomLabel();
+
+const sh = document.getElementById('sharpen'), sv = document.getElementById('sv');
+const sendSharpen = throttled('/zoom?sharpen=');
+const sharpenLabel = () => { sv.textContent = parseFloat(sh.value) === 0 ? 'off' : parseFloat(sh.value).toFixed(1) + 'x'; };
+sh.addEventListener('input', () => { sharpenLabel(); sendSharpen(sh.value); });
+sharpenLabel();
 document.getElementById('cont').onclick = () => { marker.style.display = 'none'; fetch('/afmode?mode=continuous'); };
 
 // Tap-to-focus: the AF window is WIN_FRAC of the frame in each dimension,
@@ -257,7 +274,8 @@ def af_info_text():
     fps = 1e6 / md["FrameDuration"] if md.get("FrameDuration") else 0
     return (f"AF: {af_state_names.get(md.get('AfState'), md.get('AfState'))}  "
             f"Lens: {pos if pos is None else round(pos, 2)} ({dist})  "
-            f"Zoom {view['zoom']:.2f}x  Crop: {md.get('ScalerCrop')}  "
+            f"Zoom {view['zoom']:.2f}x sharpness {md.get('Sharpness', view['sharpness']):.1f}  "
+            f"Crop: {md.get('ScalerCrop')}  "
             f"sensor {fps:.1f} fps, streamed {stats['stream_fps']:.1f} fps  "
             f"exp {md.get('ExposureTime')}us gain {md.get('AnalogueGain', 0):.1f}")
 
@@ -298,8 +316,22 @@ REFINE_STEP = 0.03
 CROP = None                # 1:1 base crop (absolute sensor coords), set at startup
 # Digital zoom = ISP ScalerCrop of a centred sub-rectangle of CROP; main stays
 # OUT_SIZE so the ISP scales it back up (1.0 = 1:1 sensor pixels).
-ZOOM_MAX = 8.0
-view = {"zoom": 1.0, "crop": None}  # current ScalerCrop
+ZOOM_MAX = 16.0
+ZOOM_LIMIT = ZOOM_MAX      # per mode: capped so the crop stays >= the ISP's minimum (set at startup)
+view = {"zoom": 1.0, "crop": None, "sharpen": 1.0, "sharpness": 1.0}  # current ScalerCrop etc.
+# Zoom sharpening, in the ISP (libcamera "Sharpness", 0-16, 1 = tuning
+# default). Measured (tools/zoom_sharpen.py): the ISP sharpens *before* its
+# upscaler, so it adds edge contrast at sensor scale but can't undo the
+# upscale's own blur; 3-6 helped at 8-16x, 12 was mostly halos and noise.
+# Post-upscale software unsharp masking (tools/usm_test.py) gained little
+# and cost ~100ms/frame at 3072x1728 (> the JPEG encode), so it's not used.
+# Sharpness = 1 + strength * log2(zoom): 2x->2, 4x->3, 8x->4, 16x->5 at
+# strength 1; strength 0 = off.
+SHARPEN_MAX_STRENGTH = 2.0
+
+
+def zoom_sharpness(level, strength):
+    return min(16.0, 1.0 + strength * math.log2(max(level, 1.0)))
 view_lock = threading.Lock()
 # Phase AF needs enough of the sensor's 16x12 PDAF grid (which covers the raw
 # readout window, not the zoomed view), so when zoomed in the AF window is
@@ -309,18 +341,22 @@ AF_WIN_MIN_FRAC = 0.4  # 0.25 at 3x zoom fell back to a contrast scan (3.2s vs ~
 
 def zoom_crop(level):
     cx0, cy0, cw, ch = CROP
-    w = max(64, int(cw / level)) & ~1
-    h = max(64, int(round(w * ch / cw))) & ~1
+    # Height first, width from it: at 720p's ~11x limit the crop is only ~64
+    # rows, where rounding the other way was ~2% off the aspect ratio.
+    h = int(ch / level) & ~1
+    w = int(round(h * cw / ch / 2)) * 2
     return (cx0 + (cw - w) // 2, cy0 + (ch - h) // 2, w, h)
 
 
-def set_zoom(level):
-    level = min(max(level, 1.0), ZOOM_MAX)
-    crop = zoom_crop(level)
+def set_zoom(level=None, sharpen=None):
     with view_lock:
-        view.update(zoom=level, crop=crop)
-    picam2.set_controls({"ScalerCrop": crop})
-    return level, crop
+        level = view["zoom"] if level is None else min(max(level, 1.0), ZOOM_LIMIT)
+        sharpen = view["sharpen"] if sharpen is None else min(max(sharpen, 0.0), SHARPEN_MAX_STRENGTH)
+        crop = zoom_crop(level)
+        sharpness = zoom_sharpness(level, sharpen)
+        view.update(zoom=level, crop=crop, sharpen=sharpen, sharpness=sharpness)
+    picam2.set_controls({"ScalerCrop": crop, "Sharpness": sharpness})
+    return level, crop, sharpness
 focus = {"gen": 0, "state": "idle", "text": "", "lens": None}
 focus_lock = threading.Lock()
 
@@ -570,7 +606,9 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     "Centre 1280x720 of the sensor from the full-res mode, ~2-3 fps")
             body = (PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max))
                     .replace("MODE_HINT", hint).replace("WIN_FRAC", str(WIN_FRAC))
-                    .replace("ZOOM_MAX", str(ZOOM_MAX)).replace("ZOOM_NOW", f"{view['zoom']:.2f}")
+                    .replace("ZOOM_LIMIT", f"{ZOOM_LIMIT:.3f}").replace("ZOOM_NOW", f"{view['zoom']:.3f}")
+                    .replace("SHARPEN_NOW", f"{view['sharpen']:.2f}")
+                    .replace("SHARPEN_MAX", str(SHARPEN_MAX_STRENGTH))
                     .replace("OUT_W", str(OUT_SIZE[0])).replace("OUT_H", str(OUT_SIZE[1]))
                     .replace("DEFAULT_AFQ", "fast" if MODE == "full" else "precise").encode())
             self._send(body, "text/html")
@@ -592,11 +630,12 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self._send(b"ok")
         elif url.path == "/zoom":
             try:
-                level = float(qs.get("level", ["1"])[0])
+                level = float(qs["level"][0]) if "level" in qs else None
+                sharpen = float(qs["sharpen"][0]) if "sharpen" in qs else None
             except ValueError:
-                level = 1.0
-            level, crop = set_zoom(level)
-            self._send(f"ok {level:.2f} {crop}".encode())
+                level = sharpen = None
+            level, crop, sharpness = set_zoom(level, sharpen)
+            self._send(f"ok zoom {level:.2f} crop {crop} sharpness {sharpness:.2f}".encode())
         elif url.path == "/tapfocus":
             try:
                 fx = min(max(float(qs.get("x", ["0.5"])[0]), 0.0), 1.0)
@@ -664,6 +703,10 @@ if __name__ == "__main__":
     crop = (x + (w - OUT_SIZE[0]) // 2, y + (h - OUT_SIZE[1]) // 2, OUT_SIZE[0], OUT_SIZE[1])
     CROP = crop
     view["crop"] = crop
+    # Highest zoom whose crop stays >= the ISP's minimum ScalerCrop (64x64 here)
+    # in both dimensions: 720p/full ~11x, 1080p and up the full 16x.
+    _min_w, _min_h = picam2.camera_controls["ScalerCrop"][0][2:]
+    ZOOM_LIMIT = min(ZOOM_MAX, crop[2] / (_min_w + 2), crop[3] / (_min_h + 2))
     picam2.set_controls({"ScalerCrop": crop, "AfMode": 0, "LensPosition": START_LENS})
     lens_min, lens_max, _ = picam2.camera_controls.get("LensPosition", (0.0, 15.0, 0.0))
 
