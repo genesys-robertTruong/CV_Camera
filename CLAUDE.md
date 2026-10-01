@@ -36,13 +36,14 @@ scp -i id_ed25519_cv_camera -o BatchMode=yes -o IdentitiesOnly=yes <src> william
 
 | File | Purpose |
 |---|---|
-| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps. Page: video fitted to the window, tap-to-focus, Fast/Precise AF switch, manual focus, digital zoom 1-16x on a log slider (ISP `ScalerCrop` of the 1:1 crop, scaled back up by the ISP; 1.0x = 1:1; capped per mode at the ISP's 64x64 minimum crop -- 720p/full ~10.9x), zoom sharpening in the ISP (`Sharpness` = 1 + strength * log2(zoom), strength slider 0-2; the ISP sharpens before upscaling, so it adds edge contrast but can't remove upscale blur; post-upscale software USM cost ~100ms/frame at 3K for little gain, see `tools/zoom_sharpen.py`, `tools/usm_test.py`) |
+| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps. Page: video fitted to the window, tap-to-focus, Fast/Precise AF switch, manual focus, digital zoom 1-16x on a log slider (ISP `ScalerCrop` of the 1:1 crop, scaled back up by the ISP; 1.0x = 1:1; capped per mode at the ISP's 64x64 minimum crop -- 720p/full ~10.9x), zoom sharpening in the ISP (`Sharpness` = 1 + strength * log2(zoom), strength slider 0-2; the ISP sharpens before upscaling, so it adds edge contrast but can't remove upscale blur; post-upscale software USM cost ~100ms/frame at 3K for little gain, see `tools/zoom_sharpen.py`, `tools/usm_test.py`). MJPEG/H.264 stream switch and CPU/temperature/throttling line -- see *Streaming* below |
 | `mjpeg_server.py` | Older 64MP server: zoom slider over the *old* custom driver's crop modes (1968x1476..3200x2400) -- those modes no longer exist with our driver, and weren't really 1:1 anyway (see below) |
-| `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity), `af_trace.py` / `af_accuracy.py` / `lens_latency.py` (AF behaviour) |
+| `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity), `af_trace.py` / `af_accuracy.py` / `lens_latency.py` (AF behaviour), `h264_test.py` (hardware H.264 throughput per config), `reconfig_test.py` / `reconfig_lens_test.py` (runtime reconfigure speed, lens after reconfigure) |
 | `mjpeg_server_csi64mp_backup.py` | Older 64MP server: single mode + ScalerCrop/software zoom + stabilization |
 | `mjpeg_server_imx477.py` | IMX477 HQ camera server (manual lens, no AF) |
 | `arducam_server.py` | USB 48MP webcam via OpenCV/V4L2, software zoom/AF sweep |
 | `tuning_64mp_sharper.json` | libcamera tuning file used by `mjpeg_server.py` |
+| `static/jmuxer.min.js` | Vendored JMuxer 2.1.0 (MIT): H.264 -> fMP4 for the page's MSE player |
 | `models/` | OpenCV Haar cascade (face detection) |
 | `install_pivariety_pkgs.sh`, `*_links.txt`, `packages.txt` | Arducam Pivariety driver/libcamera installer and package links |
 
@@ -139,6 +140,36 @@ same peak). "Continuous AF" button = plain libcamera continuous, centre-weighted
 With digital zoom, taps map through the zoomed view; the AF window is kept
 >= 40% of the 1:1 crop (the PDAF grid covers the raw readout, not the zoomed
 view -- 25% at 3x zoom fell back to scanning, 3.2s vs 1.0s).
+
+## Streaming (`mjpeg_crop.py`)
+
+Two streams, switched server-wide from the page (`/streammode?kind=`) or
+`--stream mjpeg|h264`; only one is configured at a time, and each encoder
+only runs while a client watches it.
+
+- **MJPEG**: main = full crop size RGB888, `cv2.imencode` (libjpeg-turbo,
+  software) on a 3-4 thread pool. 3k ~270% CPU, 4k ~330%.
+- **H.264**: VC4 hardware encoder (`/dev/video11`, max 1080p), so the ISP
+  scales to <= 1920x1080. Full sensor rate in every mode (720p 64, 1080p 46,
+  3k 25, 4k 18 fps) at ~50-60% of one core. Bitrate target 12 Mbit/s, but
+  the encoder overshoots at high fps (720p64 ~25 Mbit/s).
+  `/stream.h264` = `[u32 len][u32 duration us][Annex B AU]` records from a
+  keyframe (SPS/PPS repeated, IDR every 1s); the page plays it with JMuxer +
+  Media Source Extensions (WebCodecs needs HTTPS, so it's not an option on
+  plain http).
+- Measured (tools/h264_test.py): the H.264 config is a 1080p RGB main plus
+  a 1080p **lores** YUV420 into the encoder. Zoomed in, a lone YUV420 *main*
+  dropped 3k to ~21.5-22 fps (the ISP's main output upscales YUV slowly);
+  lores held 24.8 at 4x-16x. Keeping the 3k MJPEG main alongside also cost
+  1-4 fps when zoomed, hence one configuration at a time.
+- Switching closes and **reopens** the camera (~0.8s): after a plain
+  stop/configure/start the lens stops responding (LensPosition ignored,
+  metadata frozen; tools/reconfig_lens_test.py). The reopen only helps if
+  libcamera's camera manager is really destroyed, i.e. no Python object still
+  references the old camera -- `capture_loop` clears `req` after release
+  for this. If the lens ever freezes after a switch, look for a new
+  lingering reference (the log shows one "Using tuning file" per open).
+- In H.264 the focus sweep scores the lores Y plane instead of main BGR.
 
 ## Conventions
 

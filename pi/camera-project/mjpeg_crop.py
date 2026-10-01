@@ -2,9 +2,12 @@
 """Live MJPEG stream from the Arducam 64MP made of real, unscaled sensor pixels:
 a centre crop of the sensor at 720p, 1080p or 4K.
 
-    python3 mjpeg_crop.py [--mode 720|1080|3k|4k|full] [--fps N]   (default 720)
+    python3 mjpeg_crop.py [--mode 720|1080|3k|4k|full] [--fps N] [--stream mjpeg|h264]   (default 720, mjpeg)
 
 --fps locks the frame rate to N (e.g. 25) instead of running at the mode's max.
+--stream picks the starting stream; the page can switch it at runtime:
+MJPEG (full crop size, software JPEG) or H.264 (ISP-scaled to <= 1080p,
+VC4 hardware encoder, /stream.h264 played via MSE/JMuxer in static/).
 
 720/1080/4k use the patched driver's (driver/arducam_64mp) true 1:1 crop
 modes -- 1280x768 (~65fps), 1920x1104 (~47fps), 3072x1728 (~30fps), 3840x2208
@@ -17,14 +20,18 @@ Single process, one Picamera2 for its whole lifetime -- no mode switching, so
 the reconfigure timeouts that forced mjpeg_server.py's subprocess-per-mode
 design don't apply here.
 """
+import gc
 import json
 import logging
 import math
 import os
 import socketserver
+import struct
+import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http import server
 from threading import Condition
@@ -32,6 +39,8 @@ from urllib.parse import urlparse, parse_qs
 
 import cv2
 from picamera2 import Picamera2
+from picamera2.encoders import H264Encoder
+from picamera2.outputs import Output
 
 TUNING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_64mp_sharper.json")
 CAMERA_NUM = 0  # see mjpeg_server.py -- re-verify if another camera is added
@@ -76,6 +85,21 @@ else:
 # keep up with the sensor.
 ENCODER_THREADS = 4 if MODE in ("3k", "4k") else 3
 JPEG_QUALITY = 85
+# H.264 alternative (page switch, server-wide): the camera is reopened and
+# reconfigured (same raw sensor mode, ~1.3s, see switch_stream) so the ISP outputs
+# at most 1080p -- this encoder's limit -- and the VC4 hardware H.264
+# encoder compresses it. Measured (tools/h264_test.py): it keeps up in every
+# mode (720p 64fps, 1080p 46fps, 3k 25, 4k 18) at ~40-60% of one core, vs
+# ~300% for MJPEG in 4k. Only one stream's outputs are configured at a time:
+# with the full-size MJPEG main as well, zoomed-in frames (the ISP upscaling
+# into a 3k main too) cost the 3k H.264 stream 1-4 fps. Zoom, sharpening and
+# AF act upstream in the ISP/sensor, so both streams get them. Each encoder
+# only runs while a client watches it.
+H264_SIZE = (min(1920, OUT_SIZE[0]), min(1080, OUT_SIZE[1]))
+H264_BITRATE = 12_000_000
+START_STREAM = sys.argv[sys.argv.index("--stream") + 1] if "--stream" in sys.argv else "mjpeg"
+STREAM_FPS = FIXED_FPS or (1e6 / FRAME_LIMITS[1] if LLP_PARAM else 2.5)  # nominal, for the encoder
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PORT = 8080
 START_LENS = 6.65  # dioptres; starting point before the startup centre focus
 
@@ -95,8 +119,9 @@ PAGE = """\
          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   #stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
   #wrap { position: relative; line-height: 0; }
-  #video { display: block; cursor: crosshair; touch-action: manipulation;
-           -webkit-user-drag: none; user-select: none; }
+  .vid { display: block; cursor: crosshair; touch-action: manipulation;
+         -webkit-user-drag: none; user-select: none; background: #000; }
+  .vid[hidden] { display: none; }
   #marker { position: absolute; display: none; box-sizing: border-box; pointer-events: none;
             border: 2px solid #ffd54a; border-radius: 4px; transition: border-color 0.2s; }
   #marker.done { border-color: #5fd36b; } #marker.failed { border-color: #ff5a5a; }
@@ -113,11 +138,12 @@ PAGE = """\
   input[type=range] { width: 100%; accent-color: #4a9eff; }
   button { background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 0.35em 0.7em; }
   #info { font-family: ui-monospace, monospace; font-size: 0.8em; color: #9fdca0; margin-top: 0.4em; }
+  #sys { font-family: ui-monospace, monospace; font-size: 0.8em; color: #8fc3ff; margin-top: 0.2em; }
   .hint { color: #888; font-size: 0.75em; margin: 0.3em 0 0; }
 </style>
 </head>
 <body>
-<div id="stage"><div id="wrap"><img id="video" src="stream.mjpg" draggable="false" /><div id="marker"></div></div></div>
+<div id="stage"><div id="wrap"><img id="video" class="vid" draggable="false" hidden /><video id="vh264" class="vid" muted autoplay playsinline disablepictureinpicture hidden></video><div id="marker"></div></div></div>
 <div id="controls">
   <div class="row" style="margin-top: 0;">
     <button id="refocus">Focus centre</button>
@@ -125,6 +151,10 @@ PAGE = """\
     <span class="seg" title="Fast: phase-detect AF only. ~1s in 3k/4k; 720p/1080p have too little phase confidence when badly defocused and add a contrast scan (~2.5s). Lands within ~0.1-0.2 dioptre of best focus. Precise: then a contrast sweep on the tapped spot (~1-2s more) that lands on the true sharpness peak.">
       <input type="radio" name="afq" id="afFast" value="0"><label for="afFast">Fast (phase AF)</label>
       <input type="radio" name="afq" id="afPrecise" value="1"><label for="afPrecise">Precise (phase + contrast)</label>
+    </span>
+    <span class="seg" title="MJPEG: full OUT_W x OUT_H, software JPEG on the CPU, ~1 frame latency, high bandwidth. H.264: ISP-scaled to H264_W x H264_H, VC4 hardware encoder, ~12 Mbit/s, a little more latency.">
+      <input type="radio" name="stream" id="stMjpeg"><label for="stMjpeg">MJPEG OUT_W x OUT_H</label>
+      <input type="radio" name="stream" id="stH264"><label for="stH264">H.264 H264_W x H264_H</label>
     </span>
   </div>
   <div id="fstatus">Tap the video to focus there.</div>
@@ -141,18 +171,85 @@ PAGE = """\
     </label>
   </div>
   <div id="info">loading...</div>
+  <div id="sys"></div>
   <p class="hint">MODE_HINT. 1.0x = 1:1 sensor pixels; above that the ISP crops the
   centre and scales it back up. Depth of field is very shallow -- use small focus moves.</p>
 </div>
+<script src="jmuxer.min.js"></script>
 <script>
-const video = document.getElementById('video');
+const video = document.getElementById('video'), vh264 = document.getElementById('vh264');
 // Fit the video into #stage at the stream's aspect ratio.
 const ASPECT = OUT_W / OUT_H, stage = document.getElementById('stage');
 function fitVideo() {
   const r = stage.getBoundingClientRect();
   const w = Math.max(1, Math.floor(Math.min(r.width, r.height * ASPECT)));
-  video.style.width = w + 'px';
-  video.style.height = Math.floor(w / ASPECT) + 'px';
+  for (const el of [video, vh264]) {
+    el.style.width = w + 'px';
+    el.style.height = Math.floor(w / ASPECT) + 'px';
+  }
+}
+
+// Stream switch. Only the shown stream is fetched, and the server only runs
+// an encoder while someone is watching it.
+// H.264: /stream.h264 is [u32 length][u32 duration us][Annex B access unit]
+// records, starting at a keyframe; JMuxer remuxes them to fMP4 for Media
+// Source Extensions (WebCodecs would need an HTTPS page).
+const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+let h264 = null;
+function stopH264() {
+  if (!h264) return;
+  h264.ctl.abort(); h264.jm.destroy(); h264 = null;
+  vh264.removeAttribute('src'); vh264.load();
+}
+function startH264() {
+  const ctl = new AbortController();
+  const jm = new JMuxer({ node: vh264, mode: 'video', flushingTime: 0, maxDelay: 400,
+                          fps: STREAM_FPS, clearBuffer: true, debug: false });
+  const me = h264 = { ctl, jm };
+  fetch('/stream.h264', { signal: ctl.signal }).then(async (r) => {
+    const reader = r.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const nb = new Uint8Array(buf.length + value.length);
+      nb.set(buf); nb.set(value, buf.length); buf = nb;
+      let off = 0;
+      while (buf.length - off >= 8) {
+        const dv = new DataView(buf.buffer, buf.byteOffset + off, 8);
+        const len = dv.getUint32(0), dur = dv.getUint32(4);
+        if (buf.length - off < 8 + len) break;
+        jm.feed({ video: buf.subarray(off + 8, off + 8 + len), duration: dur / 1000 });
+        off += 8 + len;
+      }
+      buf = buf.subarray(off);
+    }
+  }).catch(() => {}).finally(() => {
+    // Server restarted or the connection dropped: reconnect.
+    if (h264 === me) setTimeout(() => { if (h264 === me) { stopH264(); startH264(); } }, 1000);
+  });
+  vh264.play().catch(() => {});
+}
+// Stay at the live edge (a background tab lets the buffer grow).
+setInterval(() => {
+  if (h264 && vh264.buffered.length && vh264.buffered.end(0) - vh264.currentTime > 0.5)
+    vh264.currentTime = vh264.buffered.end(0) - 0.05;
+}, 1000);
+// Show `kind`, the server's current stream (the switch is server-wide: it
+// reconfigures the camera, ~0.5s, so other viewers follow via /status).
+let shown = null;
+function setStream(kind) {
+  if (kind === shown) return;
+  shown = kind;
+  document.getElementById(kind === 'h264' ? 'stH264' : 'stMjpeg').checked = true;
+  if (kind === 'h264') {
+    video.src = BLANK; video.hidden = true;  // closes the MJPEG connection
+    vh264.hidden = false;
+    if (!h264) startH264();
+  } else {
+    stopH264(); vh264.hidden = true;
+    video.hidden = false; video.src = 'stream.mjpg?t=' + Date.now();
+  }
 }
 
 // Send slider values without flooding the server: at most one request in
@@ -223,10 +320,12 @@ function pollFocus() {
     }
   }).catch(() => {});
 }
-video.addEventListener('click', (e) => {
-  const r = video.getBoundingClientRect();
-  tapFocus((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
-});
+for (const el of [video, vh264])
+  el.addEventListener('click', (e) => {
+    e.preventDefault();
+    const r = el.getBoundingClientRect();
+    tapFocus((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height);
+  });
 document.getElementById('refocus').onclick = () => tapFocus(0.5, 0.5);
 // Fast/Precise choice: remembered per browser (default DEFAULT_AFQ).
 let afq = 'DEFAULT_AFQ';
@@ -236,13 +335,25 @@ for (const id of ['afFast', 'afPrecise'])
   document.getElementById(id).addEventListener('change', () => {
     try { localStorage.setItem('afq', id === 'afFast' ? 'fast' : 'precise'); } catch (e) {}
   });
+if (typeof JMuxer === 'undefined' || !window.MediaSource) document.getElementById('stH264').disabled = true;
+function requestStream(kind) {
+  fstatus.textContent = 'Switching stream (reconfiguring the camera)...';
+  fetch('/streammode?kind=' + kind).then(r => r.text()).then(k => { setStream(k); fstatus.textContent = ''; })
+    .catch(() => {});
+}
+document.getElementById('stMjpeg').addEventListener('change', () => requestStream('mjpeg'));
+document.getElementById('stH264').addEventListener('change', () => requestStream('h264'));
+setStream('STREAM_KIND');
 new ResizeObserver(fitVideo).observe(stage);
 window.addEventListener('resize', fitVideo);
 fitVideo();
 // Show the startup centre focus as it happens.
 marker.style.display = 'none'; polling = setInterval(pollFocus, 250);
-setInterval(() => fetch('/afinfo').then(r => r.text())
-  .then(t => document.getElementById('info').textContent = t).catch(() => {}), 1000);
+setInterval(() => fetch('/status').then(r => r.json()).then(st => {
+  document.getElementById('info').textContent = st.info;
+  document.getElementById('sys').textContent = st.sys;
+  setStream(st.stream);
+}).catch(() => {}), 1000);
 </script>
 </body>
 </html>
@@ -264,7 +375,7 @@ output = StreamingOutput()
 picam2 = None
 lens_min, lens_max = 0.0, 15.0
 af_state_names = {0: "Idle", 1: "Scanning", 2: "Focused", 3: "Failed"}
-stats = {"stream_fps": 0.0}
+stats = {"stream_fps": 0.0, "h264_fps": 0.0, "sys": ""}
 
 
 def af_info_text():
@@ -276,7 +387,7 @@ def af_info_text():
             f"Lens: {pos if pos is None else round(pos, 2)} ({dist})  "
             f"Zoom {view['zoom']:.2f}x sharpness {md.get('Sharpness', view['sharpness']):.1f}  "
             f"Crop: {md.get('ScalerCrop')}  "
-            f"sensor {fps:.1f} fps, streamed {stats['stream_fps']:.1f} fps  "
+            f"sensor {fps:.1f} fps, streamed MJPEG {stats['stream_fps']:.1f} / H.264 {stats['h264_fps']:.1f} fps  "
             f"exp {md.get('ExposureTime')}us gain {md.get('AnalogueGain', 0):.1f}")
 
 
@@ -386,8 +497,13 @@ def _set_focus(gen, state, text, lens=None):
 
 
 def _sharpness(frame, roi):
-    x, y, w, h = roi
-    g = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    """Laplacian variance of `roi` (fractions of the frame). `frame` is main
+    BGR in the MJPEG configuration, the lores Y plane in the H.264 one."""
+    fh, fw = frame.shape[:2]
+    x, y, w, h = (int(roi[0] * fw), int(roi[1] * fh), int(roi[2] * fw), int(roi[3] * fh))
+    g = frame[y:y + h, x:x + w]
+    if g.ndim == 3:
+        g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
@@ -401,6 +517,7 @@ def tap_focus(fx, fy, refine, gen):
     ow, oh = OUT_SIZE
     rw, rh = int(ow * WIN_FRAC), int(oh * WIN_FRAC)
     roi = (min(max(int(fx * ow) - rw // 2, 0), ow - rw), min(max(int(fy * oh) - rh // 2, 0), oh - rh), rw, rh)
+    roi = (roi[0] / ow, roi[1] / oh, roi[2] / ow, roi[3] / oh)  # as fractions: frame size depends on the stream
     # AF window in absolute sensor coordinates (libcamera's AfWindows use the
     # same space as ScalerCrop): AF_WIN_FRAC of the view, but never less
     # than AF_WIN_MIN_FRAC of the 1:1 crop, centred on the tapped sensor
@@ -416,6 +533,7 @@ def tap_focus(fx, fy, refine, gen):
         return
     t0 = time.time()
     picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+    af_ctl["mode"] = 2
     seq, frames, still, scanned = latest["seq"], 0, 0, 0
     af_lens, af_state, prev = None, None, None
     converged = False
@@ -447,6 +565,7 @@ def tap_focus(fx, fy, refine, gen):
         _set_focus(gen, "failed", "AF got no frames")
         return
     picam2.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": af_lens})
+    af_ctl["mode"] = 0
     t_af = time.time() - t0
     how = "Phase AF" if not scanned else "Phase+scan AF"
     if not refine:
@@ -462,13 +581,16 @@ def tap_focus(fx, fy, refine, gen):
         until frames report the last one. Returns {reported lens: mean score}."""
         scores = {}
         seq = latest["seq"]
+        kind = []  # frame type of the first scored frame; scores across types don't compare
 
         def take(seq):
             got = _wait_frame(seq)
             if got is None:
                 return None
             seq, frame, md = got
-            if md["lens"] is not None:
+            if not kind:
+                kind.append(frame.ndim)
+            if md["lens"] is not None and frame.ndim == kind[0]:
                 scores.setdefault(round(md["lens"], 3), []).append(_sharpness(frame, roi))
             return seq
 
@@ -542,6 +664,107 @@ def cancel_focus_job():
 
 encoded = {"seq": -1, "count": 0}
 encoded_lock = threading.Lock()
+clients = {"mjpeg": 0}  # MJPEG viewers; JPEG encoding (and main copies) only while > 0
+clients_lock = threading.Lock()
+
+
+class H264Broadcast(Output):
+    """Fans the hardware encoder's access units out to /stream.h264 clients.
+    Each client starts at a keyframe (SPS/PPS are repeated on every one), and
+    one that falls behind is dropped back to waiting for the next keyframe
+    rather than queueing up latency."""
+    MAX_QUEUE = 15
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.life = threading.Lock()
+        self.subs = []       # per client: {"q": deque, "cv": Condition, "synced": bool}
+        self.count = 0
+        self.prev_ts = None
+        self.encoder = None
+        self.stop_timer = None
+
+    def outputframe(self, frame, keyframe=True, timestamp=None, packet=None, audio=False):
+        dur = int(1e6 / STREAM_FPS)
+        if timestamp is not None and self.prev_ts is not None and 0 < timestamp - self.prev_ts < 2_000_000:
+            dur = timestamp - self.prev_ts
+        self.prev_ts = timestamp
+        rec = struct.pack(">II", len(frame), dur) + bytes(frame)
+        with self.lock:
+            self.count += 1
+            subs = list(self.subs)
+        for s in subs:
+            with s["cv"]:
+                if not s["synced"]:
+                    if not keyframe:
+                        continue
+                    s["synced"] = True
+                if len(s["q"]) >= self.MAX_QUEUE:
+                    s["q"].clear()
+                    s["synced"] = False
+                    continue
+                s["q"].append(rec)
+                s["cv"].notify()
+
+    # Encoder start/stop is serialised by `life`, not `lock`: stop_encoder
+    # waits for the encoder thread, which may be inside outputframe (`lock`).
+    def subscribe(self):
+        s = {"q": deque(), "cv": Condition(), "synced": False}
+        with self.life:
+            with self.lock:
+                self.subs.append(s)
+            if self.stop_timer:
+                self.stop_timer.cancel()
+                self.stop_timer = None
+            if stream["kind"] == "h264":
+                self.start_if_watched()
+        return s
+
+    def unsubscribe(self, s):
+        with self.life:
+            with self.lock:
+                self.subs.remove(s)
+                idle = not self.subs
+            if idle and self.encoder is not None and not self.stop_timer:
+                # Grace period, so a page reload or stream switch-back doesn't
+                # restart the encoder.
+                self.stop_timer = threading.Timer(5.0, self._stop_if_idle)
+                self.stop_timer.daemon = True
+                self.stop_timer.start()
+
+    def start_if_watched(self):
+        """Start the encoder if anyone is watching (caller holds `life`; the
+        camera must be in the H.264 configuration). A fresh encoder per
+        start; iperiod 1s bounds how long a new client waits for a keyframe."""
+        with self.lock:
+            watched = bool(self.subs)
+        if watched and self.encoder is None:
+            self.encoder = H264Encoder(bitrate=H264_BITRATE, iperiod=max(1, round(STREAM_FPS)),
+                                       framerate=STREAM_FPS)
+            self.prev_ts = None
+            picam2.start_encoder(self.encoder, self, name="lores")
+
+    def stop_now(self):
+        """Before reconfiguring the camera (caller holds `life`)."""
+        if self.stop_timer:
+            self.stop_timer.cancel()
+            self.stop_timer = None
+        if self.encoder is not None:
+            enc, self.encoder = self.encoder, None
+            picam2.stop_encoder(enc)
+
+    def _stop_if_idle(self):
+        with self.life:
+            self.stop_timer = None
+            with self.lock:
+                if self.subs or self.encoder is None:
+                    return
+            enc, self.encoder = self.encoder, None
+            picam2.stop_encoder(enc)
+
+
+h264_out = H264Broadcast()
 
 
 def _encode_and_publish(seq, frame, slots):
@@ -569,27 +792,143 @@ def capture_loop():
     pool = ThreadPoolExecutor(max_workers=ENCODER_THREADS)
     seq = 0
     while True:
-        req = picam2.capture_request()
-        try:
-            frame = req.make_array("main")
-            md = req.get_metadata()
-        finally:
-            req.release()
+        with cam_lock:  # held off while switch_stream reconfigures the camera
+            mjpeg = stream["kind"] == "mjpeg"
+            req = picam2.capture_request()
+            try:
+                # H.264: only the lores Y plane, for the focus scoring (the
+                # hardware encoder takes the lores buffer itself).
+                frame = req.make_array("main") if mjpeg else                     req.make_array("lores")[:H264_SIZE[1], :H264_SIZE[0]]
+                md = req.get_metadata()
+            finally:
+                req.release()
+                # Drop the reference too: a lingering request object keeps
+                # the old libcamera camera alive across switch_stream's reopen.
+                req = None
+        mjpeg = mjpeg and clients["mjpeg"] > 0
         seq += 1
         with latest_cv:
-            latest.update(seq=seq, frame=frame, lens=md.get("LensPosition"), af_state=md.get("AfState"))
+            latest.update(seq=seq, frame=frame, lens=md.get("LensPosition"), af_state=md.get("AfState"),
+                          sensor_temp=md.get("SensorTemperature"))
             latest_cv.notify_all()
-        if slots.acquire(blocking=False):
+        if mjpeg and slots.acquire(blocking=False):
             pool.submit(_encode_and_publish, seq, frame, slots)
 
 
+cam_lock = threading.Lock()
+stream = {"kind": START_STREAM}
+af_ctl = {"mode": 0}  # AfMode last set (0 manual, 2 continuous), re-applied after a switch
+
+
+def camera_config(kind):
+    if kind == "h264":
+        # The encoder takes lores, not a YUV main: zoomed in (ISP upscaling),
+        # a lone 1080p YUV420 main held only ~21.5-22 fps in 3k, while a
+        # 1080p lores (beside an equally small RGB main, which lores can't
+        # exceed) held 24.8 at 4x and 16x (tools/h264_test.py, SINGLE=1 vs
+        # MAIN=1920x1080) -- the ISP's main output upscales YUV slowly.
+        streams = {"main": {"size": H264_SIZE, "format": "RGB888"},
+                   "lores": {"size": H264_SIZE, "format": "YUV420"}}
+        buffers = 6
+    else:
+        streams, buffers = {"main": {"size": OUT_SIZE, "format": "RGB888"}}, BUFFER_COUNT
+    return picam2.create_video_configuration(**streams, raw={"size": RAW_SIZE}, buffer_count=buffers,
+                                             controls={"FrameDurationLimits": FRAME_LIMITS})
+
+
+def open_camera():
+    return Picamera2(camera_num=CAMERA_NUM, tuning=Picamera2.load_tuning_file(TUNING_FILE))
+
+
+def switch_stream(kind):
+    """Reconfigure the camera for `kind` ("mjpeg" / "h264"), keeping zoom,
+    sharpening and focus. ~1.3s: the camera is closed and reopened, because
+    after a plain stop/configure/start (~0.5s) the lens stops responding --
+    LensPosition commands ignored, metadata frozen (tools/reconfig_lens_test.py);
+    a fresh IPA doesn't have that problem."""
+    global picam2
+    with cam_lock, h264_out.life:
+        if stream["kind"] == kind:
+            return
+        cancel_focus_job()
+        lens = latest["lens"]
+        h264_out.stop_now()
+        picam2.stop()
+        picam2.close()
+        # The reopen only resets the lens if libcamera's camera manager (and
+        # with it the IPA) is really destroyed, which needs every Python
+        # reference to the old camera gone -- hence capture_loop's req = None.
+        picam2 = None
+        gc.collect()
+        picam2 = open_camera()
+        picam2.configure(camera_config(kind))
+        stream["kind"] = kind
+        with view_lock:
+            ctl = {"ScalerCrop": view["crop"], "Sharpness": view["sharpness"]}
+        ctl["AfMode"] = af_ctl["mode"]
+        if af_ctl["mode"] == 0 and lens is not None:
+            ctl["LensPosition"] = lens
+        picam2.set_controls(ctl)
+        picam2.start()
+        if kind == "h264":
+            h264_out.start_if_watched()
+
+
+def _read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def _cpu_jiffies():
+    """(busy, total) jiffies over all cores, from /proc/stat."""
+    v = [int(x) for x in _read("/proc/stat", "cpu 0 0 0 0").splitlines()[0].split()[1:]]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)  # idle + iowait
+    return sum(v) - idle, sum(v)
+
+
+def _throttled():
+    """vcgencmd get_throttled, decoded (bits 0-3 now, 16-19 since boot)."""
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=1).stdout
+        bits = int(out.strip().split("=")[1], 16)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return "?"
+    names = {0: "under-voltage", 1: "freq capped", 2: "THROTTLED", 3: "soft temp limit"}
+    now = [n for b, n in names.items() if bits & (1 << b)]
+    past = [n for b, n in names.items() if bits & (1 << (b + 16)) and not bits & (1 << b)]
+    return (", ".join(now) or "ok") + (f" (since boot: {', '.join(past)})" if past else "")
+
+
 def stream_fps_loop():
+    """Stream fps plus system load/temps for the page, every 2s."""
+    ncpu = os.cpu_count() or 1
     while True:
         with encoded_lock:
             start = encoded["count"]
+        start_h = h264_out.count
+        busy0, total0 = _cpu_jiffies()
+        t0, p0 = time.monotonic(), os.times()
         time.sleep(2)
+        el = time.monotonic() - t0
         with encoded_lock:
-            stats["stream_fps"] = (encoded["count"] - start) / 2
+            stats["stream_fps"] = (encoded["count"] - start) / el
+        stats["h264_fps"] = (h264_out.count - start_h) / el
+        busy1, total1 = _cpu_jiffies()
+        p1 = os.times()
+        cpu = 100 * (busy1 - busy0) / max(1, total1 - total0)
+        proc = 100 * (p1.user + p1.system - p0.user - p0.system) / el  # % of one core
+        soc = _read("/sys/class/thermal/thermal_zone0/temp")
+        mhz = _read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        with latest_cv:
+            sensor_t = latest.get("sensor_temp")
+        stats["sys"] = (f"CPU {cpu:.0f}% of {ncpu} cores (this server {proc:.0f}% of one core)"
+                        + (f" @ {int(mhz) // 1000} MHz" if mhz else "")
+                        + (f"  SoC {int(soc) / 1000:.1f}\u00b0C" if soc else "")
+                        + (f"  sensor {sensor_t:.0f}\u00b0C" if sensor_t is not None else "")
+                        + f"  throttling: {_throttled()}")
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
@@ -610,6 +949,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     .replace("SHARPEN_NOW", f"{view['sharpen']:.2f}")
                     .replace("SHARPEN_MAX", str(SHARPEN_MAX_STRENGTH))
                     .replace("OUT_W", str(OUT_SIZE[0])).replace("OUT_H", str(OUT_SIZE[1]))
+                    .replace("H264_W", str(H264_SIZE[0])).replace("H264_H", str(H264_SIZE[1]))
+                    .replace("STREAM_FPS", f"{STREAM_FPS:.2f}").replace("STREAM_KIND", stream["kind"])
                     .replace("DEFAULT_AFQ", "fast" if MODE == "full" else "precise").encode())
             self._send(body, "text/html")
         elif url.path == "/focus":
@@ -620,13 +961,14 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             pos = max(lens_min, min(pos, lens_max))
             cancel_focus_job()
             picam2.set_controls({"AfMode": 0, "LensPosition": pos})
+            af_ctl["mode"] = 0
             self._send(f"ok {pos:.2f}".encode())
         elif url.path == "/afmode":
             # Continuous AF uses the default (centre-weighted) metering again.
             from libcamera import controls
             cancel_focus_job()
-            picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Auto,
-                                 "AfMode": 0 if qs.get("mode", [""])[0] == "manual" else 2})
+            af_ctl["mode"] = 0 if qs.get("mode", [""])[0] == "manual" else 2
+            picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Auto, "AfMode": af_ctl["mode"]})
             self._send(b"ok")
         elif url.path == "/zoom":
             try:
@@ -648,6 +990,15 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             with focus_lock:
                 body = json.dumps({k: focus[k] for k in ("state", "text", "lens")}).encode()
             self._send(body, "application/json")
+        elif url.path == "/streammode":
+            # Server-wide: reconfigures the camera, so every viewer switches.
+            kind = qs.get("kind", [""])[0]
+            if kind in ("mjpeg", "h264"):
+                switch_stream(kind)
+            self._send(stream["kind"].encode())
+        elif url.path == "/status":
+            body = json.dumps({"info": af_info_text(), "sys": stats["sys"], "stream": stream["kind"]})
+            self._send(body.encode(), "application/json")
         elif url.path == "/afinfo":
             self._send(af_info_text().encode())
         elif url.path == "/stream.mjpg":
@@ -657,10 +1008,16 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header("Pragma", "no-cache")
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
             self.end_headers()
+            with clients_lock:
+                clients["mjpeg"] += 1
             try:
                 while True:
                     with output.condition:
-                        output.condition.wait()
+                        # Timeout: a client that connects while nothing is
+                        # encoding must not wait forever (encoding starts on
+                        # the next frame now that it is counted).
+                        if not output.condition.wait(timeout=2.0):
+                            continue
                         frame = output.frame
                     self.wfile.write(b"--FRAME\r\nContent-Type: image/jpeg\r\n")
                     self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
@@ -668,6 +1025,31 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     self.wfile.write(b"\r\n")
             except (BrokenPipeError, ConnectionResetError) as e:
                 logging.info("Client %s disconnected: %s", self.client_address, e)
+            finally:
+                with clients_lock:
+                    clients["mjpeg"] -= 1
+        elif url.path == "/stream.h264":
+            self.send_response(200)
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Content-Type", "application/octet-stream")
+            self.end_headers()
+            sub = h264_out.subscribe()
+            try:
+                while True:
+                    with sub["cv"]:
+                        while not sub["q"]:
+                            sub["cv"].wait()
+                        recs = list(sub["q"])
+                        sub["q"].clear()
+                    self.wfile.write(b"".join(recs))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                logging.info("H.264 client %s disconnected: %s", self.client_address, e)
+            finally:
+                h264_out.unsubscribe(sub)
+        elif url.path == "/jmuxer.min.js":
+            with open(os.path.join(STATIC_DIR, "jmuxer.min.js"), "rb") as f:
+                self._send(f.read(), "application/javascript")
         else:
             self.send_error(404)
 
@@ -688,13 +1070,8 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 
 
 if __name__ == "__main__":
-    picam2 = Picamera2(camera_num=CAMERA_NUM, tuning=Picamera2.load_tuning_file(TUNING_FILE))
-    picam2.configure(picam2.create_video_configuration(
-        main={"size": OUT_SIZE, "format": "RGB888"},
-        raw={"size": RAW_SIZE},
-        buffer_count=BUFFER_COUNT,
-        controls={"FrameDurationLimits": FRAME_LIMITS},
-    ))
+    picam2 = open_camera()
+    picam2.configure(camera_config(stream["kind"]))
     picam2.start()
 
     # ScalerCrop bounds are only valid after configure(); max_crop is the
