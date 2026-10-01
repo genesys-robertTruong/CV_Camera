@@ -21,3 +21,12 @@ captures/
 
 # Scratch / working files (frames, sweeps, probes)
 work/
+
+# Kernel module build output
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order

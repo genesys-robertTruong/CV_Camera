@@ -139,9 +139,33 @@ struct arducam_64mp_mode {
 	/* Default framerate. */
 	struct v4l2_fract timeperframe_default;
 
+	/*
+	 * CV_Camera: true 1:1 crop mode whose line length and minimum vblank
+	 * come from the crop_llp / crop_min_vblank module params instead of
+	 * line_length_pix / timeperframe_default.
+	 */
+	bool tunable_crop;
+
 	/* Default register values */
 	struct arducam_64mp_reg_list reg_list;
 };
+
+/*
+ * CV_Camera: line length (pixels at the 900MHz pixel rate) of the 1:1 crop
+ * mode. Read when the mode is selected, so a new value takes effect on the
+ * next camera start. Measured on this module (CM4, CAM0, 2026-10-01): image
+ * correct for every value from the full mode's 0xb6b2 (46770, 22fps) down to
+ * 15000 (70fps); 14800 and below gives garbage. Default 16000 = 6.7% margin,
+ * 64.7fps, 0 bad frames in a 30s / 1942-frame soak (pi/camera-project/tools/soak.py).
+ */
+static unsigned int crop_llp = 16000;
+module_param(crop_llp, uint, 0644);
+MODULE_PARM_DESC(crop_llp, "Line length (pixels) of the 1:1 crop mode");
+
+/* Going below ~100 intermittently drops rows (16-64 zero rows seen at 60/24/12). */
+static unsigned int crop_min_vblank = 100;
+module_param(crop_min_vblank, uint, 0644);
+MODULE_PARM_DESC(crop_min_vblank, "Minimum vertical blanking (lines) of the 1:1 crop mode");
 
 static const s64 arducam_64mp_link_freq_menu[] = {
 	ARDUCAM_64MP_DEFAULT_LINK_FREQ,
@@ -930,6 +954,85 @@ static const struct arducam_64mp_reg mode_8000x6000_regs[] = {
 	{0x3421, 0xf4},
 };
 
+/*
+ * CV_Camera: true 1:1 centre crop, 1280x768. Same registers as the 8000x6000
+ * 1:1 crop above (no binning, full-res remosaic) with only the window,
+ * output size, frame length and 0x341e/0x3420 changed. 0x341e and 0x3420
+ * equal width/16 and height/12 in every stock mode, so they're derived the
+ * same way here. 768 rows, not 720, so the size doesn't collide with the
+ * stock binned 1280x720 mode in v4l2_find_nearest_size(); crop to 720 in
+ * the ISP. Line length (0x0342) is overwritten from crop_llp at stream on.
+ * Verified true 1:1: raw correlates 0.967 with full-res raw of the same
+ * pixels vs 0.946 with it 2x2-binned (pi/camera-project/tools/bin_test.py).
+ *
+ * Window (pixel-array coords): x 3984..5263, y 3088..3855.
+ */
+static const struct arducam_64mp_reg mode_1280x768_crop_regs[] = {
+	{0x0342, 0xb6},
+	{0x0343, 0xb2},
+	{0x0340, 0x03},
+	{0x0341, 0x64},
+	{0x0344, 0x0f},
+	{0x0345, 0x90},
+	{0x0346, 0x0c},
+	{0x0347, 0x10},
+	{0x0348, 0x14},
+	{0x0349, 0x8f},
+	{0x034a, 0x0f},
+	{0x034b, 0x0f},
+	{0x0900, 0x00},
+	{0x0901, 0x11},
+	{0x0902, 0x0a},
+	{0x30d8, 0x00},
+	{0x3200, 0x01},
+	{0x3201, 0x01},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040a, 0x00},
+	{0x040b, 0x00},
+	{0x040c, 0x05},
+	{0x040d, 0x00},
+	{0x040e, 0x03},
+	{0x040f, 0x00},
+	{0x034c, 0x05},
+	{0x034d, 0x00},
+	{0x034e, 0x03},
+	{0x034f, 0x00},
+	{0x30d9, 0x01},
+	{0x32d5, 0x01},
+	{0x32d6, 0x00},
+	{0x401e, 0x00},
+	{0x40b8, 0x04},
+	{0x40b9, 0x20},
+	{0x40bc, 0x02},
+	{0x40bd, 0x58},
+	{0x40be, 0x02},
+	{0x40bf, 0x58},
+	{0x41a4, 0x00},
+	{0x5a09, 0x01},
+	{0x5a17, 0x01},
+	{0x5a25, 0x01},
+	{0x5a33, 0x01},
+	{0x98d7, 0x14},
+	{0x98d8, 0x14},
+	{0x98d9, 0x00},
+	{0x99c4, 0x00},
+	{0x0202, 0x03},
+	{0x0203, 0x00},
+	{0x0204, 0x00},
+	{0x0205, 0x00},
+	{0x020e, 0x01},
+	{0x020f, 0x00},
+	{0x341a, 0x00},
+	{0x341b, 0x00},
+	{0x341c, 0x00},
+	{0x341d, 0x00},
+	{0x341e, 0x00},
+	{0x341f, 0x50},
+	{0x3420, 0x00},
+	{0x3421, 0x40},
+};
+
 /* 16 mpix 10fps */
 static const struct arducam_64mp_reg mode_4624x3472_regs[] = {
 	{0x0342, 0x63},
@@ -1363,6 +1466,25 @@ static const struct arducam_64mp_mode supported_modes[] = {
 			.num_of_regs = ARRAY_SIZE(mode_1280x720_regs),
 			.regs = mode_1280x720_regs,
 		}
+	}, {
+		.width = 1280,
+		.height = 768,
+		.line_length_pix = 0xb6b2,	/* unused: see crop_llp */
+		.crop = {
+			.left = ARDUCAM_64MP_PIXEL_ARRAY_LEFT + 3984,
+			.top = ARDUCAM_64MP_PIXEL_ARRAY_TOP + 3088,
+			.width = 1280,
+			.height = 768,
+		},
+		.timeperframe_default = {	/* unused: see crop_min_vblank */
+			.numerator = 100,
+			.denominator = 2000
+		},
+		.tunable_crop = true,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1280x768_crop_regs),
+			.regs = mode_1280x768_crop_regs,
+		}
 	},
 };
 
@@ -1442,6 +1564,9 @@ struct arducam_64mp {
 
 	/* Current mode */
 	const struct arducam_64mp_mode *mode;
+
+	/* CV_Camera: line length in use, latched from crop_llp at mode select */
+	unsigned int line_length_pix;
 
 	/*
 	 * Mutex for serialized access:
@@ -1869,13 +1994,22 @@ static void arducam_64mp_set_framing_limits(struct arducam_64mp *arducam_64mp)
 	unsigned int frm_length_min, frm_length_default, hblank;
 	const struct arducam_64mp_mode *mode = arducam_64mp->mode;
 
-	/* The default framerate is highest possible framerate. */
-	frm_length_min =
-		arducam_64mp_get_frame_length(mode,
-					      &mode->timeperframe_default);
-	frm_length_default =
-		arducam_64mp_get_frame_length(mode,
-					      &mode->timeperframe_default);
+	if (mode->tunable_crop) {
+		/* Clamp so hblank stays >= 0 and fits the 16-bit register. */
+		arducam_64mp->line_length_pix =
+			clamp_t(unsigned int, crop_llp, mode->width, 0xffff);
+		frm_length_min = mode->height + crop_min_vblank;
+		frm_length_default = frm_length_min;
+	} else {
+		arducam_64mp->line_length_pix = mode->line_length_pix;
+		/* The default framerate is highest possible framerate. */
+		frm_length_min =
+			arducam_64mp_get_frame_length(mode,
+						      &mode->timeperframe_default);
+		frm_length_default =
+			arducam_64mp_get_frame_length(mode,
+						      &mode->timeperframe_default);
+	}
 
 	/* Default to no long exposure multiplier. */
 	arducam_64mp->long_exp_shift = 0;
@@ -1896,7 +2030,7 @@ static void arducam_64mp_set_framing_limits(struct arducam_64mp *arducam_64mp)
 	 * depends on mode->width only, and is not changeable in any
 	 * way other than changing the mode.
 	 */
-	hblank = mode->line_length_pix - mode->width;
+	hblank = arducam_64mp->line_length_pix - mode->width;
 	__v4l2_ctrl_modify_range(arducam_64mp->hblank, hblank, hblank, 1,
 				 hblank);
 }
@@ -2029,6 +2163,16 @@ static int arducam_64mp_start_streaming(struct arducam_64mp *arducam_64mp)
 	if (ret) {
 		dev_err(&client->dev, "%s failed to set mode\n", __func__);
 		return ret;
+	}
+
+	if (arducam_64mp->mode->tunable_crop) {
+		ret = arducam_64mp_write_reg(arducam_64mp, 0x0342,
+					     ARDUCAM_64MP_REG_VALUE_16BIT,
+					     arducam_64mp->line_length_pix);
+		if (ret)
+			return ret;
+		dev_info(&client->dev, "1:1 crop mode: line length %u, min vblank %u\n",
+			 arducam_64mp->line_length_pix, crop_min_vblank);
 	}
 
 	/* Apply customized values from user */

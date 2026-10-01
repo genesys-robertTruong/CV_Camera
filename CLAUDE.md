@@ -6,13 +6,17 @@ this Windows repo and runs on the Pi; there is no git on the Pi itself.
 ## Target device
 
 - Host: `william@192.168.159.116` (hostname `cv-camera`)
-- Raspberry Pi, aarch64, Debian 13 (trixie), Python 3.13, OpenCV 4.10, picamera2
-- ~900 MB RAM, ~1.7 GB free on the SD card -- keep large captures off it
+- Raspberry Pi Compute Module 4 (VC4 ISP, `bcm2835_unicam_legacy`), aarch64,
+  Debian 13 (trixie), kernel 6.18.34+rpt-rpi-v8, Python 3.13, OpenCV 4.10, picamera2
+- ~900 MB RAM, 512 MB CMA, ~1.7 GB free on the SD card -- keep large captures off it
+- `william` has passwordless sudo
 - Project dir on the Pi: `~/camera-project` (mirrored here in `pi/camera-project/`)
-- Cameras: Arducam 64MP (Hawk-Eye, CSI, custom `arducam_64mp` driver with
-  extra 1x1 crop modes). Code also exists for an IMX477 HQ camera (currently
-  removed) and an Arducam B0478 USB 48MP (USB2-limited to 1280x720 @ 10fps).
-  Check `rpicam-hello --list-cameras` before assuming which are attached.
+- Cameras: Arducam 64MP Hawk-Eye (Sony IMX682, Quad-Bayer with on-chip
+  remosaic) on CAM0 (`dtoverlay=arducam-64mp,cam0`, 2-lane, 456 MHz link),
+  running our patched driver (`driver/`). Code also exists for an IMX477 HQ
+  camera (currently removed) and an Arducam B0478 USB 48MP (USB2-limited to
+  1280x720 @ 10fps). Check `rpicam-hello --list-cameras` before assuming
+  which are attached.
 
 ## SSH access
 
@@ -32,7 +36,9 @@ scp -i id_ed25519_cv_camera -o BatchMode=yes -o IdentitiesOnly=yes <src> william
 
 | File | Purpose |
 |---|---|
-| `mjpeg_server.py` | Main server: Arducam 64MP live MJPEG view. Zoom switches between real sensor crop modes; each mode runs in a fresh worker subprocess (reusing one Picamera2 across reconfigures times out after ~3 switches) |
+| `mjpeg_crop720.py` | **Current 64MP stream**: true 1:1 centre 1280x720 at ~65fps from the patched driver's 1280x768 crop mode (`--full` = same pixels from the full-res mode, ~2.3fps) |
+| `mjpeg_server.py` | Older 64MP server: zoom slider over the *old* custom driver's crop modes (1968x1476..3200x2400) -- those modes no longer exist with our driver, and weren't really 1:1 anyway (see below) |
+| `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity) |
 | `mjpeg_server_csi64mp_backup.py` | Older 64MP server: single mode + ScalerCrop/software zoom + stabilization |
 | `mjpeg_server_imx477.py` | IMX477 HQ camera server (manual lens, no AF) |
 | `arducam_server.py` | USB 48MP webcam via OpenCV/V4L2, software zoom/AF sweep |
@@ -52,18 +58,37 @@ encoder pool, plus a decoupled stabilization worker.
    and stop it with `pkill -f mjpeg_server.py`.
 4. If you change files on the Pi directly, copy them back here before committing.
 
-Images, logs, `.deb` files and `captures/` are not tracked.
+Images, logs, `.deb` files, `captures/` and `work/` (scratch output) are not tracked.
 
-## Custom crop modes are NOT true 1:1
+## Sensor driver (`driver/`)
 
-The custom `arducam_64mp.ko` (built 2026-09-25, stock kept as
-`arducam_64mp.ko.xz.stock-backup`; source not on the Pi) adds 1968x1476..3200x2400
-"1:1 crop" modes. Raw-level tests show they are effectively 2x2-binned and
-re-expanded inside the sensor (half the real detail, blocky edges) -- see
-`work/bin_test.py`. They also have a fixed 44802-px HBLANK (52 us/line), which
-is why they cap at ~10fps. Only the stock full 9248x6944 mode gives true 1:1
-detail (~2.7fps sensor max; raw is 9152 wide after the ISP's width limit).
-`mjpeg_crop720.py` uses the full mode by default (`--custom` for the old one).
+`driver/arducam_64mp/arducam_64mp.c` is upstream raspberrypi/linux
+`rpi-6.18.y` (first commit, unmodified) plus our changes (`git diff` that
+commit to see them, all marked `CV_Camera`):
+
+- New **1280x768 true 1:1 centre crop** mode, registers copied from the stock
+  8000x6000 1:1 mode with only window/size/frame length changed. 768 not 720
+  so it doesn't collide with the stock *binned* 1280x720 mode; crop to 720 in
+  the ISP. Window x 3984..5263, y 3088..3855.
+- Module params `crop_llp` (line length, default 16000) and `crop_min_vblank`
+  (default 100), writable at runtime via `/sys/module/arducam_64mp/parameters/`
+  and read on the next camera start -- no reload needed to tune.
+- Measured limits: llp >= 15000 gives a correct image (70fps), <= 14800 is
+  garbage; vblank < 100 intermittently drops rows. 16000/100 = 64.8fps, 0 bad
+  frames in a 1942-frame soak.
+
+Install: copy `driver/` to the Pi, run `./install.sh`, then **reboot**
+(`./install.sh --rollback` restores the module that was there before,
+`arducam_64mp.ko.pre-cv-camera`). **Never `rmmod`/`modprobe` the sensor
+driver**: `bcm2835_unicam_legacy` can't take the subdev re-registering and the
+kernel BUGs in `media_gobj_create` -- only a reboot recovers.
+
+Why the old custom driver (built 2026-09-25, source lost; backed up as
+`arducam_64mp.ko.pre-cv-camera`) was replaced: its "1:1" crop modes were
+effectively 2x2-binned and re-expanded inside the sensor (raw correlated 0.944
+with 2x2-binned full-res vs 0.923 with true full-res; blocky edges), and they
+kept the full mode's 46770-px line length, capping them at ~10fps. That line
+length is what a 9152-px row needs over the 2-lane link; a 1280-px row doesn't.
 
 ## Focusing the 64MP
 

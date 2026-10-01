@@ -2,14 +2,11 @@
 """Live 720p MJPEG stream from the Arducam 64MP made of real, unscaled sensor
 pixels: the centre 1280x720 of the sensor, i.e. ~7.2x zoom vs full width.
 
-There's no true 1280x720 1:1 mode in the arducam_64mp driver (the stock
-1280x720 mode is a 4x4 bin of a 5120x2880 window, not a crop), so this runs
-a full-sensor mode and uses ISP ScalerCrop to cut 1280x720 out of its centre,
-with main also 1280x720 -- the ISP does no scaling, so output pixels map 1:1
-to sensor pixels. fps is capped by the sensor mode's frame time (~2.7fps
-full-res), not by encoding; a fast true-720p stream needs a properly built
-1280x720 crop mode in the driver itself (see RAW_SIZE below for why the
-existing custom crop modes don't qualify).
+Default: the patched driver's (driver/arducam_64mp) 1280x768 true 1:1 crop
+mode at ~65fps; ISP ScalerCrop trims it to the centre 1280x720 with main also
+1280x720, so the ISP does no scaling and output pixels map 1:1 to sensor
+pixels. `--full` instead crops the same pixels out of the stock full-res mode
+(~2.3fps) -- a slow reference that doesn't need the patched driver.
 
 Single process, one Picamera2 for its whole lifetime -- no mode switching, so
 the reconfigure timeouts that forced mjpeg_server.py's subprocess-per-mode
@@ -21,6 +18,7 @@ import socketserver
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http import server
 from threading import Condition
 from urllib.parse import urlparse, parse_qs
@@ -31,17 +29,19 @@ from picamera2 import Picamera2
 TUNING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_64mp_sharper.json")
 CAMERA_NUM = 0  # see mjpeg_server.py -- re-verify if another camera is added
 
-# Default: the stock full-res 9248x6944 mode -- the only mode measured to give
-# true 1:1 detail. The custom "1:1" crop modes (e.g. 1968x1476, `--custom`)
-# were found to be effectively 2x2-binned then re-expanded inside the sensor:
-# their raw correlates better with full-res raw binned 2x2 per Bayer plane
-# (0.944) than with the full-res raw itself (0.923), and show 2-px blockiness
-# the full mode doesn't (see work/bin_test.py). Cost of full-res: ~2.3fps
-# (sensor frame time 370ms) and ~80MB CMA per raw buffer.
-CUSTOM_CROP_MODE = "--custom" in sys.argv
-RAW_SIZE = (1968, 1476) if CUSTOM_CROP_MODE else (9248, 6944)
-BUFFER_COUNT = 4  # 3 -> 2.25fps, 2 -> 1.5fps in full-res mode; CMA is 512MB
+FULL_MODE = "--full" in sys.argv
+if FULL_MODE:
+    # Full-res: ~80MB CMA per raw buffer; 3 -> 2.25fps, 2 -> 1.5fps.
+    RAW_SIZE, BUFFER_COUNT = (9248, 6944), 4
+    FRAME_LIMITS = (100, 1000000)
+else:
+    RAW_SIZE, BUFFER_COUNT = (1280, 768), 6
+    # Cap the frame time at the mode's own ~15.4ms so auto-exposure makes up
+    # for dim light with gain instead of stretching frames (indoors AE
+    # otherwise picks ~30ms and halves the frame rate).
+    FRAME_LIMITS = (1000, 15500)
 OUT_SIZE = (1280, 720)
+ENCODER_THREADS = 3  # one 720p imencode is ~10-15ms on the CM4; 65fps needs >1
 JPEG_QUALITY = 85
 PORT = 8080
 START_LENS = 6.65  # dioptres; best focus for the bench scene (see CLAUDE.md)
@@ -76,7 +76,7 @@ PAGE = """\
     </label>
   </div>
   <div id="info">loading...</div>
-  <p class="hint">Centre 1280x720 of the sensor, 1:1 pixels (no binning, no scaling). Full-res sensor mode: ~2-3 fps.
+  <p class="hint">Centre 1280x720 of the sensor, 1:1 pixels (no binning, no scaling). MODE_HINT.
   Depth of field is very shallow -- use small slider moves.</p>
 </div>
 <script>
@@ -116,6 +116,7 @@ output = StreamingOutput()
 picam2 = None
 lens_min, lens_max = 0.0, 15.0
 af_state_names = {0: "Idle", 1: "Scanning", 2: "Focused", 3: "Failed"}
+stats = {"stream_fps": 0.0}
 
 
 def af_info_text():
@@ -125,7 +126,8 @@ def af_info_text():
     fps = 1e6 / md["FrameDuration"] if md.get("FrameDuration") else 0
     return (f"AF: {af_state_names.get(md.get('AfState'), md.get('AfState'))}  "
             f"Lens: {pos if pos is None else round(pos, 2)} ({dist})  "
-            f"Crop: {md.get('ScalerCrop')}  {fps:.1f} fps")
+            f"Crop: {md.get('ScalerCrop')}  sensor {fps:.1f} fps, streamed {stats['stream_fps']:.1f} fps  "
+            f"exp {md.get('ExposureTime')}us gain {md.get('AnalogueGain', 0):.1f}")
 
 
 def refocus():
@@ -137,12 +139,48 @@ def refocus():
             break
 
 
+encoded = {"seq": -1, "count": 0}
+encoded_lock = threading.Lock()
+
+
+def _encode_and_publish(seq, frame, slots):
+    try:
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not ok:
+            return
+        with encoded_lock:
+            # Encoders finish out of order; never publish an older frame
+            # over a newer one.
+            if seq <= encoded["seq"]:
+                return
+            encoded["seq"] = seq
+            encoded["count"] += 1
+        output.write(jpg.tobytes())
+    finally:
+        slots.release()
+
+
 def capture_loop():
+    # cv2.imencode releases the GIL, so a small pool encodes in parallel.
+    # `slots` bounds frames in flight: when encoders fall behind, new frames
+    # are dropped here instead of queueing up latency.
+    slots = threading.Semaphore(ENCODER_THREADS)
+    pool = ThreadPoolExecutor(max_workers=ENCODER_THREADS)
+    seq = 0
     while True:
         frame = picam2.capture_array("main")
-        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        if ok:
-            output.write(jpg.tobytes())
+        seq += 1
+        if slots.acquire(blocking=False):
+            pool.submit(_encode_and_publish, seq, frame, slots)
+
+
+def stream_fps_loop():
+    while True:
+        with encoded_lock:
+            start = encoded["count"]
+        time.sleep(2)
+        with encoded_lock:
+            stats["stream_fps"] = (encoded["count"] - start) / 2
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
@@ -154,7 +192,9 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header("Location", "/index.html")
             self.end_headers()
         elif url.path == "/index.html":
-            body = PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max)).encode()
+            hint = "Full-res sensor mode: ~2-3 fps" if FULL_MODE else "1:1 crop sensor mode: ~65 fps"
+            body = (PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max))
+                    .replace("MODE_HINT", hint).encode())
             self._send(body, "text/html")
         elif url.path == "/focus":
             try:
@@ -215,11 +255,12 @@ if __name__ == "__main__":
         main={"size": OUT_SIZE, "format": "RGB888"},
         raw={"size": RAW_SIZE},
         buffer_count=BUFFER_COUNT,
+        controls={"FrameDurationLimits": FRAME_LIMITS},
     ))
     picam2.start()
 
     # ScalerCrop bounds are only valid after configure(); max_crop is the
-    # mode's full 1968x1476 window in full-sensor coordinates.
+    # raw mode's whole window in full-sensor coordinates.
     x, y, w, h = picam2.camera_controls["ScalerCrop"][1]
     crop = (x + (w - OUT_SIZE[0]) // 2, y + (h - OUT_SIZE[1]) // 2, OUT_SIZE[0], OUT_SIZE[1])
     # Start in manual focus: continuous AF on this narrow crop was seen
@@ -228,6 +269,7 @@ if __name__ == "__main__":
     lens_min, lens_max, _ = picam2.camera_controls.get("LensPosition", (0.0, 15.0, 0.0))
 
     threading.Thread(target=capture_loop, daemon=True).start()
+    threading.Thread(target=stream_fps_loop, daemon=True).start()
     try:
         http_server = StreamingServer(("0.0.0.0", PORT), StreamingHandler)
         print(f"Serving 720p sensor-crop stream (crop {crop}) on :{PORT}/index.html")
