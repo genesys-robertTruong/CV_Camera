@@ -36,7 +36,7 @@ scp -i id_ed25519_cv_camera -o BatchMode=yes -o IdentitiesOnly=yes <src> william
 
 | File | Purpose |
 |---|---|
-| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps) |
+| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps |
 | `mjpeg_server.py` | Older 64MP server: zoom slider over the *old* custom driver's crop modes (1968x1476..3200x2400) -- those modes no longer exist with our driver, and weren't really 1:1 anyway (see below) |
 | `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity) |
 | `mjpeg_server_csi64mp_backup.py` | Older 64MP server: single mode + ScalerCrop/software zoom + stabilization |
@@ -68,11 +68,11 @@ commit to see them, all marked `CV_Camera`):
 
 - Three **true 1:1 centre-crop** modes, built from the stock 8000x6000 1:1
   register set (`crop_1to1_base_regs`) plus a per-mode window list:
-  1280x768, 1920x1104, 3840x2208. Heights are 768/1104/2208 rather than
+  1280x768, 1920x1104, 3072x1728, 3840x2208. Heights are 768/1104/2208 rather than
   720/1080/2160 so they don't collide with the stock *binned* modes of those
   sizes; the ISP crops to 720/1080/2160. All verified 1:1 with
   `tools/bin_test.py`.
-- Module params `llp_720p` / `llp_1080p` / `llp_4k` (line length per mode)
+- Module params `llp_720p` / `llp_1080p` / `llp_3k` / `llp_4k` (line length per mode)
   and `crop_min_vblank`, writable at runtime via
   `/sys/module/arducam_64mp/parameters/` and read on the next camera start --
   no reload needed to tune. Below a mode's minimum line length the image is
@@ -82,11 +82,15 @@ commit to see them, all marked `CV_Camera`):
 |---|---|---|---|---|
 | 1280x768 | 15000 ok, 14800 bad | 16000 | 64.8 | sensor row time ~16.7us |
 | 1920x1104 | 15000 ok, 14000 bad | 16000 | 46.7 | same sensor row time |
+| 3072x1728 | 16000 ok, 15500 bad | 17000 | 29.0 | 2-lane MIPI (largest 16:9 crop that clears 25fps) |
 | 3840x2208 | 20000 ok, 19500 bad | 21500 | 18.1 | 2-lane MIPI: 456MHz DDR x2 = 1.824Gbps = 182.4Mpx/s RAW10, so a 3840px row is 21.05us + per-line overhead |
 
 vblank < 100 intermittently drops rows. All defaults: 0 corrupt frames in
 30s soaks (`tools/soak.py`). The sensor row-time floor doesn't scale with
-width, so it's internal (readout/remosaic); only 4K is link-bound. More 4K
+width, so it's internal (readout/remosaic); only 3K and 4K are link-bound.
+Rough model for a new crop: min llp = max(15000, 4.93 * width + ~1000), then
+fps = 900e6 / ((height + 100) * llp * 1.07). New modes also need width % 16,
+height % 12 and a window start on a 16-px (x) / 8-px (y) grid. More 4K
 fps would need fewer rows, a higher link frequency (undocumented PLL regs),
 or 4 lanes (CM4 CAM1 is 4-lane; unverified whether this module wires 4).
 

@@ -2,12 +2,14 @@
 """Live MJPEG stream from the Arducam 64MP made of real, unscaled sensor pixels:
 a centre crop of the sensor at 720p, 1080p or 4K.
 
-    python3 mjpeg_crop.py [--mode 720|1080|4k|full]      (default 720)
+    python3 mjpeg_crop.py [--mode 720|1080|3k|4k|full] [--fps N]   (default 720)
+
+--fps locks the frame rate to N (e.g. 25) instead of running at the mode's max.
 
 720/1080/4k use the patched driver's (driver/arducam_64mp) true 1:1 crop
-modes -- 1280x768 (~65fps), 1920x1104 (~47fps), 3840x2208 (~18fps) -- and ISP
-ScalerCrop trims each to the centre 1280x720 / 1920x1080 / 3840x2160 with
-main the same size, so the ISP does no scaling and output pixels map 1:1 to
+modes -- 1280x768 (~65fps), 1920x1104 (~47fps), 3072x1728 (~30fps), 3840x2208
+(~18fps) -- and ISP ScalerCrop trims each to the centre 1280x720 / 1920x1080 /
+3072x1728 / 3840x2160 with main the same size, so the ISP does no scaling and output pixels map 1:1 to
 sensor pixels. `full` crops the centre 1280x720 out of the stock full-res
 mode (~2.3fps) -- a slow reference that doesn't need the patched driver.
 
@@ -36,6 +38,7 @@ CAMERA_NUM = 0  # see mjpeg_server.py -- re-verify if another camera is added
 MODES = {
     "720": ((1280, 768), (1280, 720), 6, "llp_720p"),
     "1080": ((1920, 1104), (1920, 1080), 6, "llp_1080p"),
+    "3k": ((3072, 1728), (3072, 1728), 4, "llp_3k"),
     "4k": ((3840, 2208), (3840, 2160), 4, "llp_4k"),  # 25MB RGB888 per main buffer
     "full": ((9248, 6944), (1280, 720), 4, None),  # ~80MB CMA per raw buffer
 }
@@ -54,16 +57,22 @@ def _crop_mode_frame_us():
     return int(lines * param(LLP_PARAM) / PIXEL_RATE * 1e6)
 
 
-if LLP_PARAM:
+FIXED_FPS = float(sys.argv[sys.argv.index("--fps") + 1]) if "--fps" in sys.argv else None
+if FIXED_FPS:
+    if LLP_PARAM and 1e6 / FIXED_FPS < _crop_mode_frame_us():
+        sys.exit(f"--fps {FIXED_FPS:g} is faster than the {MODE} mode's max "
+                 f"{1e6 / _crop_mode_frame_us():.1f}fps")
+    FRAME_LIMITS = (int(1e6 / FIXED_FPS),) * 2
+elif LLP_PARAM:
     # Cap the frame time at the mode's own minimum (+1%) so auto-exposure
     # makes up for dim light with gain instead of stretching frames (indoors
     # AE otherwise picks ~30ms and halves 720p's frame rate).
     FRAME_LIMITS = (1000, int(_crop_mode_frame_us() * 1.01))
 else:
     FRAME_LIMITS = (100, 1000000)
-# cv2.imencode on the CM4 is ~10-15ms at 720p; 4K needs all 4 cores to get
-# near the sensor's 18fps.
-ENCODER_THREADS = 4 if MODE == "4k" else 3
+# cv2.imencode on the CM4 is ~10-15ms at 720p; 3K/4K need all 4 cores to
+# keep up with the sensor.
+ENCODER_THREADS = 4 if MODE in ("3k", "4k") else 3
 JPEG_QUALITY = 85
 PORT = 8080
 START_LENS = 6.65  # dioptres; best focus for the bench scene (see CLAUDE.md)

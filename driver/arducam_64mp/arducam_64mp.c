@@ -169,7 +169,10 @@ struct arducam_64mp_mode {
  *   the limit: 1.824Gbps / 10 bits = 182.4Mpx/s, so a 3840px row is 21.05us
  *   (18950 here) of payload plus per-line packet/LP-HS overhead. Default
  *   21500 = 18fps.
- * All three: 0 corrupt frames / 0 dropped rows in 30s soaks.
+ * - 3k (3072x1728): the largest 16:9 1:1 crop that clears 25fps. Link-bound
+ *   like 4k (3072px = 15160 of payload): 16000 ok, 15500 garbage. Default
+ *   17000 = 29.7fps.
+ * All: 0 corrupt frames / 0 dropped rows in 30s soaks.
  */
 static unsigned int llp_720p = 16000;
 module_param(llp_720p, uint, 0644);
@@ -178,6 +181,10 @@ MODULE_PARM_DESC(llp_720p, "Line length (pixels) of the 1280x768 1:1 crop mode")
 static unsigned int llp_1080p = 16000;
 module_param(llp_1080p, uint, 0644);
 MODULE_PARM_DESC(llp_1080p, "Line length (pixels) of the 1920x1104 1:1 crop mode");
+
+static unsigned int llp_3k = 17000;
+module_param(llp_3k, uint, 0644);
+MODULE_PARM_DESC(llp_3k, "Line length (pixels) of the 3072x1728 1:1 crop mode");
 
 static unsigned int llp_4k = 21500;
 module_param(llp_4k, uint, 0644);
@@ -1089,6 +1096,35 @@ static const struct arducam_64mp_reg mode_1920x1104_crop_regs[] = {
 	{0x3421, 0x5c},
 };
 
+/* Window (pixel-array coords): x 3088..6159, y 2608..4335. No stock mode is
+ * this size, so it needs no taller-than-output trick. */
+static const struct arducam_64mp_reg mode_3072x1728_crop_regs[] = {
+	{0x0342, 0xb6},
+	{0x0343, 0xb2},
+	{0x0340, 0x07},
+	{0x0341, 0x24},
+	{0x0344, 0x0c},
+	{0x0345, 0x10},
+	{0x0346, 0x0a},
+	{0x0347, 0x30},
+	{0x0348, 0x18},
+	{0x0349, 0x0f},
+	{0x034a, 0x10},
+	{0x034b, 0xef},
+	{0x040c, 0x0c},
+	{0x040d, 0x00},
+	{0x040e, 0x06},
+	{0x040f, 0xc0},
+	{0x034c, 0x0c},
+	{0x034d, 0x00},
+	{0x034e, 0x06},
+	{0x034f, 0xc0},
+	{0x341e, 0x00},
+	{0x341f, 0xc0},
+	{0x3420, 0x00},
+	{0x3421, 0x90},
+};
+
 /* Window (pixel-array coords): x 2704..6543, y 2368..4575. */
 static const struct arducam_64mp_reg mode_3840x2208_crop_regs[] = {
 	{0x0342, 0xb6},
@@ -1587,6 +1623,25 @@ static const struct arducam_64mp_mode supported_modes[] = {
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_1920x1104_crop_regs),
 			.regs = mode_1920x1104_crop_regs,
+		}
+	}, {
+		.width = 3072,
+		.height = 1728,
+		.line_length_pix = 0xb6b2,	/* unused: see llp_param */
+		.crop = {
+			.left = ARDUCAM_64MP_PIXEL_ARRAY_LEFT + 3088,
+			.top = ARDUCAM_64MP_PIXEL_ARRAY_TOP + 2608,
+			.width = 3072,
+			.height = 1728,
+		},
+		.timeperframe_default = {	/* unused: see crop_min_vblank */
+			.numerator = 100,
+			.denominator = 2000
+		},
+		.llp_param = &llp_3k,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_3072x1728_crop_regs),
+			.regs = mode_3072x1728_crop_regs,
 		}
 	}, {
 		.width = 3840,
