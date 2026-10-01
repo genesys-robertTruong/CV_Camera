@@ -85,30 +85,40 @@ PAGE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; background: #000; color: #ddd;
+  html, body { height: 100%; }
+  /* Video takes whatever height the controls leave; JS (fitVideo) sizes the
+     image to fit that box at the stream's aspect ratio, so the controls are
+     always on screen and the tap marker stays aligned with the picture. */
+  body { margin: 0; background: #000; color: #ddd; display: flex; flex-direction: column;
+         height: 100vh; height: 100dvh; overflow: hidden;
          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  #wrap { position: relative; width: fit-content; max-width: 100%; margin: 0 auto; }
-  #video { display: block; max-width: 100%; cursor: crosshair; touch-action: manipulation;
+  #stage { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  #wrap { position: relative; line-height: 0; }
+  #video { display: block; cursor: crosshair; touch-action: manipulation;
            -webkit-user-drag: none; user-select: none; }
   #marker { position: absolute; display: none; box-sizing: border-box; pointer-events: none;
             border: 2px solid #ffd54a; border-radius: 4px; transition: border-color 0.2s; }
   #marker.done { border-color: #5fd36b; } #marker.failed { border-color: #ff5a5a; }
-  .seg { display: inline-flex; margin-left: 0.8em; border: 1px solid #444; border-radius: 4px; overflow: hidden; vertical-align: middle; }
+  .seg { display: inline-flex; border: 1px solid #444; border-radius: 4px; overflow: hidden; vertical-align: middle; }
   .seg input { display: none; }
   .seg label { padding: 0.35em 0.7em; cursor: pointer; background: #222; color: #aaa; }
   .seg input:checked + label { background: #2f5d8f; color: #fff; }
   #fstatus { font-family: ui-monospace, monospace; font-size: 0.85em; color: #ffd54a; margin-top: 0.4em; min-height: 1.2em; }
-  #controls { max-width: 1280px; margin: 0 auto; padding: 0.8em 1em; }
+  #controls { flex: 0 0 auto; max-height: 45vh; overflow-y: auto; box-sizing: border-box;
+              width: 100%; max-width: 1280px; margin: 0 auto; padding: 0.5em 1em 0.6em;
+              overflow-x: hidden; overflow-wrap: anywhere; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4em 1.2em; margin-top: 0.4em; }
+  .row > label { flex: 1 1 260px; min-width: 0; }  /* let sliders shrink on phones */
   input[type=range] { width: 100%; accent-color: #4a9eff; }
   button { background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 0.35em 0.7em; }
-  #info { font-family: ui-monospace, monospace; font-size: 0.85em; color: #9fdca0; margin-top: 0.5em; }
-  .hint { color: #888; font-size: 0.8em; }
+  #info { font-family: ui-monospace, monospace; font-size: 0.8em; color: #9fdca0; margin-top: 0.4em; }
+  .hint { color: #888; font-size: 0.75em; margin: 0.3em 0 0; }
 </style>
 </head>
 <body>
-<div id="wrap"><img id="video" src="stream.mjpg" draggable="false" /><div id="marker"></div></div>
+<div id="stage"><div id="wrap"><img id="video" src="stream.mjpg" draggable="false" /><div id="marker"></div></div></div>
 <div id="controls">
-  <div>
+  <div class="row" style="margin-top: 0;">
     <button id="refocus">Focus centre</button>
     <button id="cont">Continuous AF</button>
     <span class="seg" title="Fast: phase-detect AF only. ~1s in 3k/4k; 720p/1080p have too little phase confidence when badly defocused and add a contrast scan (~2.5s). Lands within ~0.1-0.2 dioptre of best focus. Precise: then a contrast sweep on the tapped spot (~1-2s more) that lands on the true sharpness peak.">
@@ -117,32 +127,63 @@ PAGE = """\
     </span>
   </div>
   <div id="fstatus">Tap the video to focus there.</div>
-  <div style="margin-top: 0.6em;">
+  <div class="row">
     <label>Manual focus (dioptres): <span id="fv"></span>
       <input type="range" id="focus" min="LENS_MIN" max="LENS_MAX" step="0.01" value="6.65">
     </label>
+    <label>Digital zoom (ISP crop): <span id="zv"></span>
+      <input type="range" id="zoom" min="1" max="ZOOM_MAX" step="0.05" value="ZOOM_NOW">
+    </label>
+    <button id="zoom1">1x</button>
   </div>
   <div id="info">loading...</div>
-  <p class="hint">MODE_HINT. 1:1 sensor pixels (no binning, no scaling).
-  Depth of field is very shallow -- use small slider moves.</p>
+  <p class="hint">MODE_HINT. 1.0x = 1:1 sensor pixels; above that the ISP crops the
+  centre and scales it back up. Depth of field is very shallow -- use small focus moves.</p>
 </div>
 <script>
-const f = document.getElementById('focus'), fv = document.getElementById('fv');
-let pending = false, queued = null;
-function send(pos) {
-  if (pending) { queued = pos; return; }
-  pending = true;
-  fetch('/focus?position=' + pos).finally(() => {
-    pending = false;
-    if (queued !== null) { const q = queued; queued = null; send(q); }
-  });
+const video = document.getElementById('video');
+// Fit the video into #stage at the stream's aspect ratio.
+const ASPECT = OUT_W / OUT_H, stage = document.getElementById('stage');
+function fitVideo() {
+  const r = stage.getBoundingClientRect();
+  const w = Math.max(1, Math.floor(Math.min(r.width, r.height * ASPECT)));
+  video.style.width = w + 'px';
+  video.style.height = Math.floor(w / ASPECT) + 'px';
 }
-f.addEventListener('input', () => { fv.textContent = f.value; marker.style.display = 'none'; send(f.value); });
+
+// Send slider values without flooding the server: at most one request in
+// flight per endpoint, latest value wins.
+function throttled(path) {
+  let pending = false, queued = null;
+  const send = (v) => {
+    if (pending) { queued = v; return; }
+    pending = true;
+    fetch(path + v).finally(() => {
+      pending = false;
+      if (queued !== null) { const q = queued; queued = null; send(q); }
+    });
+  };
+  return send;
+}
+const f = document.getElementById('focus'), fv = document.getElementById('fv');
+const sendFocus = throttled('/focus?position=');
+f.addEventListener('input', () => { fv.textContent = f.value; marker.style.display = 'none'; sendFocus(f.value); });
+
+const z = document.getElementById('zoom'), zv = document.getElementById('zv');
+const sendZoom = throttled('/zoom?level=');
+function zoomLabel() {
+  const v = parseFloat(z.value);
+  zv.textContent = v.toFixed(2) + 'x' + (v <= 1.0001 ? ' (1:1 sensor pixels)' : ' (ISP upscaled)');
+}
+function setZoom(v) { z.value = v; zoomLabel(); marker.style.display = 'none'; sendZoom(z.value); }
+z.addEventListener('input', () => setZoom(z.value));
+document.getElementById('zoom1').onclick = () => setZoom(1);
+zoomLabel();
 document.getElementById('cont').onclick = () => { marker.style.display = 'none'; fetch('/afmode?mode=continuous'); };
 
 // Tap-to-focus: the AF window is WIN_FRAC of the frame in each dimension,
 // centred on the tap (clamped inside the frame), same as the server uses.
-const WIN = WIN_FRAC, video = document.getElementById('video'), marker = document.getElementById('marker');
+const WIN = WIN_FRAC, marker = document.getElementById('marker');
 const fstatus = document.getElementById('fstatus');
 let polling = null;
 function tapFocus(fx, fy) {
@@ -178,6 +219,9 @@ for (const id of ['afFast', 'afPrecise'])
   document.getElementById(id).addEventListener('change', () => {
     try { localStorage.setItem('afq', id === 'afFast' ? 'fast' : 'precise'); } catch (e) {}
   });
+new ResizeObserver(fitVideo).observe(stage);
+window.addEventListener('resize', fitVideo);
+fitVideo();
 // Show the startup centre focus as it happens.
 marker.style.display = 'none'; polling = setInterval(pollFocus, 250);
 setInterval(() => fetch('/afinfo').then(r => r.text())
@@ -213,7 +257,8 @@ def af_info_text():
     fps = 1e6 / md["FrameDuration"] if md.get("FrameDuration") else 0
     return (f"AF: {af_state_names.get(md.get('AfState'), md.get('AfState'))}  "
             f"Lens: {pos if pos is None else round(pos, 2)} ({dist})  "
-            f"Crop: {md.get('ScalerCrop')}  sensor {fps:.1f} fps, streamed {stats['stream_fps']:.1f} fps  "
+            f"Zoom {view['zoom']:.2f}x  Crop: {md.get('ScalerCrop')}  "
+            f"sensor {fps:.1f} fps, streamed {stats['stream_fps']:.1f} fps  "
             f"exp {md.get('ExposureTime')}us gain {md.get('AnalogueGain', 0):.1f}")
 
 
@@ -250,7 +295,32 @@ REFINE_HALF_RANGE = 0.30   # dioptres either side of the AF result. Phase AF was
                            # landing 0.1-0.2 short; at 0.21 that hit the sweep edge and cost
                            # a second pair of passes (4 short passes ~96 frames vs 2 wide ~60)
 REFINE_STEP = 0.03
-CROP = None                # ScalerCrop in use (absolute sensor coords), set at startup
+CROP = None                # 1:1 base crop (absolute sensor coords), set at startup
+# Digital zoom = ISP ScalerCrop of a centred sub-rectangle of CROP; main stays
+# OUT_SIZE so the ISP scales it back up (1.0 = 1:1 sensor pixels).
+ZOOM_MAX = 8.0
+view = {"zoom": 1.0, "crop": None}  # current ScalerCrop
+view_lock = threading.Lock()
+# Phase AF needs enough of the sensor's 16x12 PDAF grid (which covers the raw
+# readout window, not the zoomed view), so when zoomed in the AF window is
+# kept at least this fraction of the 1:1 crop.
+AF_WIN_MIN_FRAC = 0.4  # 0.25 at 3x zoom fell back to a contrast scan (3.2s vs ~0.9s)
+
+
+def zoom_crop(level):
+    cx0, cy0, cw, ch = CROP
+    w = max(64, int(cw / level)) & ~1
+    h = max(64, int(round(w * ch / cw))) & ~1
+    return (cx0 + (cw - w) // 2, cy0 + (ch - h) // 2, w, h)
+
+
+def set_zoom(level):
+    level = min(max(level, 1.0), ZOOM_MAX)
+    crop = zoom_crop(level)
+    with view_lock:
+        view.update(zoom=level, crop=crop)
+    picam2.set_controls({"ScalerCrop": crop})
+    return level, crop
 focus = {"gen": 0, "state": "idle", "text": "", "lens": None}
 focus_lock = threading.Lock()
 
@@ -288,21 +358,24 @@ def _sharpness(frame, roi):
 def tap_focus(fx, fy, refine, gen):
     from libcamera import controls
     cx0, cy0, cw, ch = CROP
-
-    def window(frac):
-        """Rect of `frac` of the crop centred on the tap, clamped inside it,
-        relative to the crop's top-left."""
-        ww, wh = int(cw * frac), int(ch * frac)
-        return (min(max(int(fx * cw) - ww // 2, 0), cw - ww),
-                min(max(int(fy * ch) - wh // 2, 0), ch - wh), ww, wh)
-
-    rx, ry, ww, wh = window(WIN_FRAC)
-    roi = (rx * OUT_SIZE[0] // cw, ry * OUT_SIZE[1] // ch, ww * OUT_SIZE[0] // cw, wh * OUT_SIZE[1] // ch)
-    ax, ay, aw, ah = window(AF_WIN_FRAC)
-    # libcamera's AF windows are in absolute sensor coordinates (same space
-    # as ScalerCrop).
+    with view_lock:
+        vx, vy, vw, vh = view["crop"]
+    # Contrast-scoring ROI: WIN_FRAC of the *output* frame (= what's on
+    # screen, zoomed or not) centred on the tap -- matches the page marker.
+    ow, oh = OUT_SIZE
+    rw, rh = int(ow * WIN_FRAC), int(oh * WIN_FRAC)
+    roi = (min(max(int(fx * ow) - rw // 2, 0), ow - rw), min(max(int(fy * oh) - rh // 2, 0), oh - rh), rw, rh)
+    # AF window in absolute sensor coordinates (libcamera's AfWindows use the
+    # same space as ScalerCrop): AF_WIN_FRAC of the view, but never less
+    # than AF_WIN_MIN_FRAC of the 1:1 crop, centred on the tapped sensor
+    # point and clamped inside the 1:1 crop.
+    aw = min(cw, max(int(vw * AF_WIN_FRAC), int(cw * AF_WIN_MIN_FRAC)))
+    ah = min(ch, max(int(vh * AF_WIN_FRAC), int(ch * AF_WIN_MIN_FRAC)))
+    px, py = vx + fx * vw, vy + fy * vh
+    ax = min(max(int(px - aw / 2), cx0), cx0 + cw - aw)
+    ay = min(max(int(py - ah / 2), cy0), cy0 + ch - ah)
     picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Windows,
-                         "AfWindows": [(cx0 + ax, cy0 + ay, aw, ah)]})
+                         "AfWindows": [(ax, ay, aw, ah)]})
     if not _set_focus(gen, "focusing", "Focusing (libcamera AF)..."):
         return
     t0 = time.time()
@@ -497,6 +570,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     "Centre 1280x720 of the sensor from the full-res mode, ~2-3 fps")
             body = (PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max))
                     .replace("MODE_HINT", hint).replace("WIN_FRAC", str(WIN_FRAC))
+                    .replace("ZOOM_MAX", str(ZOOM_MAX)).replace("ZOOM_NOW", f"{view['zoom']:.2f}")
+                    .replace("OUT_W", str(OUT_SIZE[0])).replace("OUT_H", str(OUT_SIZE[1]))
                     .replace("DEFAULT_AFQ", "fast" if MODE == "full" else "precise").encode())
             self._send(body, "text/html")
         elif url.path == "/focus":
@@ -515,6 +590,13 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             picam2.set_controls({"AfMetering": controls.AfMeteringEnum.Auto,
                                  "AfMode": 0 if qs.get("mode", [""])[0] == "manual" else 2})
             self._send(b"ok")
+        elif url.path == "/zoom":
+            try:
+                level = float(qs.get("level", ["1"])[0])
+            except ValueError:
+                level = 1.0
+            level, crop = set_zoom(level)
+            self._send(f"ok {level:.2f} {crop}".encode())
         elif url.path == "/tapfocus":
             try:
                 fx = min(max(float(qs.get("x", ["0.5"])[0]), 0.0), 1.0)
@@ -581,6 +663,7 @@ if __name__ == "__main__":
     x, y, w, h = picam2.camera_controls["ScalerCrop"][1]
     crop = (x + (w - OUT_SIZE[0]) // 2, y + (h - OUT_SIZE[1]) // 2, OUT_SIZE[0], OUT_SIZE[1])
     CROP = crop
+    view["crop"] = crop
     picam2.set_controls({"ScalerCrop": crop, "AfMode": 0, "LensPosition": START_LENS})
     lens_min, lens_max, _ = picam2.camera_controls.get("LensPosition", (0.0, 15.0, 0.0))
 

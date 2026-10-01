@@ -36,7 +36,7 @@ scp -i id_ed25519_cv_camera -o BatchMode=yes -o IdentitiesOnly=yes <src> william
 
 | File | Purpose |
 |---|---|
-| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps |
+| `mjpeg_crop.py` | **Current 64MP stream**: true 1:1 centre crop, `--mode 720` (default, ~65fps), `1080` (~45fps), `3k` (3072x1728, ~27fps streamed; `--fps 25` locks a steady 25), `4k` (~17fps streamed, ~100 Mbit/s, ~300% CPU), `full` (centre 720p from the full-res mode, ~2.3fps). `--fps N` locks any mode to N fps. Page: video fitted to the window, tap-to-focus, Fast/Precise AF switch, manual focus, digital zoom 1-8x (ISP `ScalerCrop` of the 1:1 crop, scaled back up by the ISP; 1.0x = 1:1) |
 | `mjpeg_server.py` | Older 64MP server: zoom slider over the *old* custom driver's crop modes (1968x1476..3200x2400) -- those modes no longer exist with our driver, and weren't really 1:1 anyway (see below) |
 | `tools/` | Measurement scripts, run on the Pi from `~/camera-project` (data in `work/`): `bin_test.py` (is a mode really 1:1?), `llp_sweep_one.py` (one line-length trial), `soak.py` (per-frame integrity), `af_trace.py` / `af_accuracy.py` / `lens_latency.py` (AF behaviour) |
 | `mjpeg_server_csi64mp_backup.py` | Older 64MP server: single mode + ScalerCrop/software zoom + stabilization |
@@ -136,6 +136,9 @@ switch: **Fast** = phase stage only (3k 0.9s, 4k 1.4s from far defocus;
 20% tapped ROI, lens stepped every frame (+-0.30 dioptre, 0.03 steps), up and
 down passes averaged, parabolic fit (adds ~1.5-2.5s; all modes land on the
 same peak). "Continuous AF" button = plain libcamera continuous, centre-weighted.
+With digital zoom, taps map through the zoomed view; the AF window is kept
+>= 40% of the 1:1 crop (the PDAF grid covers the raw readout, not the zoomed
+view -- 25% at 3x zoom fell back to scanning, 3.2s vs 1.0s).
 
 ## Conventions
 
