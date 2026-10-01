@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Live 720p MJPEG stream from the Arducam 64MP made of real, unscaled sensor
-pixels: the centre 1280x720 of the sensor, i.e. ~7.2x zoom vs full width.
+"""Live MJPEG stream from the Arducam 64MP made of real, unscaled sensor pixels:
+a centre crop of the sensor at 720p, 1080p or 4K.
 
-Default: the patched driver's (driver/arducam_64mp) 1280x768 true 1:1 crop
-mode at ~65fps; ISP ScalerCrop trims it to the centre 1280x720 with main also
-1280x720, so the ISP does no scaling and output pixels map 1:1 to sensor
-pixels. `--full` instead crops the same pixels out of the stock full-res mode
-(~2.3fps) -- a slow reference that doesn't need the patched driver.
+    python3 mjpeg_crop.py [--mode 720|1080|4k|full]      (default 720)
+
+720/1080/4k use the patched driver's (driver/arducam_64mp) true 1:1 crop
+modes -- 1280x768 (~65fps), 1920x1104 (~47fps), 3840x2208 (~18fps) -- and ISP
+ScalerCrop trims each to the centre 1280x720 / 1920x1080 / 3840x2160 with
+main the same size, so the ISP does no scaling and output pixels map 1:1 to
+sensor pixels. `full` crops the centre 1280x720 out of the stock full-res
+mode (~2.3fps) -- a slow reference that doesn't need the patched driver.
 
 Single process, one Picamera2 for its whole lifetime -- no mode switching, so
 the reconfigure timeouts that forced mjpeg_server.py's subprocess-per-mode
@@ -29,19 +32,38 @@ from picamera2 import Picamera2
 TUNING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuning_64mp_sharper.json")
 CAMERA_NUM = 0  # see mjpeg_server.py -- re-verify if another camera is added
 
-FULL_MODE = "--full" in sys.argv
-if FULL_MODE:
-    # Full-res: ~80MB CMA per raw buffer; 3 -> 2.25fps, 2 -> 1.5fps.
-    RAW_SIZE, BUFFER_COUNT = (9248, 6944), 4
-    FRAME_LIMITS = (100, 1000000)
+# mode: (raw sensor mode, output size, buffer count, driver line-length param)
+MODES = {
+    "720": ((1280, 768), (1280, 720), 6, "llp_720p"),
+    "1080": ((1920, 1104), (1920, 1080), 6, "llp_1080p"),
+    "4k": ((3840, 2208), (3840, 2160), 4, "llp_4k"),  # 25MB RGB888 per main buffer
+    "full": ((9248, 6944), (1280, 720), 4, None),  # ~80MB CMA per raw buffer
+}
+MODE = sys.argv[sys.argv.index("--mode") + 1] if "--mode" in sys.argv else "720"
+RAW_SIZE, OUT_SIZE, BUFFER_COUNT, LLP_PARAM = MODES[MODE]
+DRIVER_PARAMS = "/sys/module/arducam_64mp/parameters"
+PIXEL_RATE = 900e6  # ARDUCAM_64MP_PIXEL_RATE in the driver
+
+
+def _crop_mode_frame_us():
+    """The crop mode's minimum frame time, from the driver's live params."""
+    def param(name):
+        with open(os.path.join(DRIVER_PARAMS, name)) as f:
+            return int(f.read())
+    lines = RAW_SIZE[1] + param("crop_min_vblank")
+    return int(lines * param(LLP_PARAM) / PIXEL_RATE * 1e6)
+
+
+if LLP_PARAM:
+    # Cap the frame time at the mode's own minimum (+1%) so auto-exposure
+    # makes up for dim light with gain instead of stretching frames (indoors
+    # AE otherwise picks ~30ms and halves 720p's frame rate).
+    FRAME_LIMITS = (1000, int(_crop_mode_frame_us() * 1.01))
 else:
-    RAW_SIZE, BUFFER_COUNT = (1280, 768), 6
-    # Cap the frame time at the mode's own ~15.4ms so auto-exposure makes up
-    # for dim light with gain instead of stretching frames (indoors AE
-    # otherwise picks ~30ms and halves the frame rate).
-    FRAME_LIMITS = (1000, 15500)
-OUT_SIZE = (1280, 720)
-ENCODER_THREADS = 3  # one 720p imencode is ~10-15ms on the CM4; 65fps needs >1
+    FRAME_LIMITS = (100, 1000000)
+# cv2.imencode on the CM4 is ~10-15ms at 720p; 4K needs all 4 cores to get
+# near the sensor's 18fps.
+ENCODER_THREADS = 4 if MODE == "4k" else 3
 JPEG_QUALITY = 85
 PORT = 8080
 START_LENS = 6.65  # dioptres; best focus for the bench scene (see CLAUDE.md)
@@ -49,7 +71,7 @@ START_LENS = 6.65  # dioptres; best focus for the bench scene (see CLAUDE.md)
 PAGE = """\
 <html>
 <head>
-<title>64MP -- 720p Sensor Crop</title>
+<title>64MP -- 1:1 Sensor Crop</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: dark; }
@@ -76,7 +98,7 @@ PAGE = """\
     </label>
   </div>
   <div id="info">loading...</div>
-  <p class="hint">Centre 1280x720 of the sensor, 1:1 pixels (no binning, no scaling). MODE_HINT.
+  <p class="hint">MODE_HINT. 1:1 sensor pixels (no binning, no scaling).
   Depth of field is very shallow -- use small slider moves.</p>
 </div>
 <script>
@@ -192,7 +214,9 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header("Location", "/index.html")
             self.end_headers()
         elif url.path == "/index.html":
-            hint = "Full-res sensor mode: ~2-3 fps" if FULL_MODE else "1:1 crop sensor mode: ~65 fps"
+            hint = (f"Centre {OUT_SIZE[0]}x{OUT_SIZE[1]} of the sensor, {MODE} mode, "
+                    f"max {1e6 / FRAME_LIMITS[1]:.0f} fps" if LLP_PARAM else
+                    "Centre 1280x720 of the sensor from the full-res mode, ~2-3 fps")
             body = (PAGE.replace("LENS_MIN", str(lens_min)).replace("LENS_MAX", str(lens_max))
                     .replace("MODE_HINT", hint).encode())
             self._send(body, "text/html")
@@ -272,7 +296,7 @@ if __name__ == "__main__":
     threading.Thread(target=stream_fps_loop, daemon=True).start()
     try:
         http_server = StreamingServer(("0.0.0.0", PORT), StreamingHandler)
-        print(f"Serving 720p sensor-crop stream (crop {crop}) on :{PORT}/index.html")
+        print(f"Serving {MODE} sensor-crop stream (crop {crop}, frame limits {FRAME_LIMITS}) on :{PORT}/index.html")
         http_server.serve_forever()
     finally:
         picam2.stop()
